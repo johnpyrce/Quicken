@@ -1,0 +1,11 @@
+# Python cache
+__pycache__/
+.mypy_cache/
+
+# Data directories
+lots-*/
+orig_lots/
+
+# Data files
+*.csv
+*.xlsx
