@@ -36,8 +36,9 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from decimal import Decimal, InvalidOperation
+from openpyxl import load_workbook
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 
 
 # -------------------------
@@ -45,7 +46,7 @@ from typing import Dict, List, Tuple, Optional
 # -------------------------
 
 LOTS_DIR = Path("lots")  # required name; no parameter
-POSITIONS_SUMMARY_FILE = Path("schwab_positions.csv")  # optional; auto-used if present
+POSITIONS_SUMMARY_FILE = Path("Quicken_Lots.xlsx")  # optional; auto-used if present
 
 OUT_CHECKLIST = Path("quicken_addshares_checklist.csv")
 OUT_SUBTOTALS = Path("quicken_security_subtotals.csv")
@@ -101,8 +102,17 @@ def parse_date_any(s: str) -> date:
     raise ValueError(f"Unrecognized date format: {s!r}")
 
 
-def parse_decimal_any(s: str) -> Decimal:
-    s = (s or "").strip()
+def parse_decimal_any(s) -> Decimal:
+    if s is None:
+        raise ValueError("Empty numeric field")
+
+    if isinstance(s, Decimal):
+        return s
+
+    if isinstance(s, (int, float)):
+        return Decimal(str(s))
+
+    s = str(s).strip()
     if not s:
         raise ValueError("Empty numeric field")
     
@@ -115,7 +125,7 @@ def parse_decimal_any(s: str) -> Decimal:
         neg = True
         s = s[1:-1].strip()
 
-    s = s.replace("$", "").replace(",", "").strip()
+    s = s.replace("$", "").replace(",", "").replace("*", "").strip()
     try:
         v = Decimal(s)
     except InvalidOperation:
@@ -169,6 +179,23 @@ def extract_as_of_date_from_title(title_line: str) -> Optional[date]:
         except Exception:
             return None
     return None
+
+
+def extract_account_suffix_from_title(title_line: str) -> Optional[str]:
+    """
+    Example: "AAPL Lot Details for  ...993 as of 01:13 PM ET, 04/25/2026"
+    Returns the visible masked account suffix, e.g. "993".
+    """
+    title_line = (title_line or "").strip()
+    m = re.search(r"for\s+\.\.\.(\d{3,4})\b", title_line, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
+
+
+def slugify_account_name(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", (name or "").strip()).strip("_").lower()
+    return slug or "account"
 
 
 def find_header_row(rows: List[List[str]]) -> int:
@@ -240,6 +267,23 @@ def load_lots_file(path: Path) -> Tuple[List[Lot], date]:
     return (lots, as_of)
 
 
+def load_cash_file(path: Path) -> Decimal:
+    text = path.read_text(encoding="utf-8-sig")
+    rows = list(csv.reader(text.splitlines()))
+    if len(rows) < 4:
+        return Decimal("0")
+
+    header = rows[2]
+    idx = {h.strip(): i for i, h in enumerate(header)}
+    cost_idx = idx.get("Cost Basis")
+    if cost_idx is None:
+        return Decimal("0")
+
+    value_row = rows[3]
+    cost_raw = value_row[cost_idx] if cost_idx < len(value_row) else "0"
+    return parse_decimal_any(cost_raw)
+
+
 # -------------------------
 # Bucketing
 # -------------------------
@@ -290,6 +334,15 @@ def aggregate_all(files: List[Path]) -> Tuple[List[AggRow], Dict[str, Dict[str, 
     per_symbol_counts: Dict[str, Dict[str, int]] = {}
 
     for f in files:
+        if f.stem.lower() == "cash":
+            cash_cost = load_cash_file(f)
+            sym = "CASH"
+            per_symbol_counts.setdefault(sym, {"lot_files": 0, "lots": 0, "bucket_rows": 0})
+            per_symbol_counts[sym]["lot_files"] += 1
+            per_symbol_counts[sym]["lots"] += 1
+            per_symbol_totals[sym] = {"shares": Decimal("0"), "cost": cash_cost}
+            continue
+
         lots, as_of = load_lots_file(f)
         if not lots:
             continue
@@ -352,115 +405,131 @@ def aggregate_all(files: List[Path]) -> Tuple[List[AggRow], Dict[str, Dict[str, 
 # Positions summary validation
 # -------------------------
 
-def detect_positions_columns(header: List[str]) -> Tuple[str, str, str]:
-    """
-    Try to find columns for:
-      symbol/ticker, shares/quantity, total cost basis
-    """
-    h = [c.strip() for c in header]
-    lower_map = {c.lower(): c for c in h}
+def detect_account_suffix_from_lot_files(paths: List[Path]) -> Optional[str]:
+    suffixes: Set[str] = set()
 
-    def pick(candidates: List[str]) -> Optional[str]:
-        for c in candidates:
-            if c.lower() in lower_map:
-                return lower_map[c.lower()]
+    for path in paths:
+        text = path.read_text(encoding="utf-8-sig")
+        rows = list(csv.reader(text.splitlines()))
+        if not rows:
+            continue
+        title_line = rows[0][0] if rows[0] else ""
+        suffix = extract_account_suffix_from_title(title_line)
+        if suffix:
+            suffixes.add(suffix)
+
+    if not suffixes:
         return None
-
-    sym = pick(["Symbol", "Ticker", "Security", "Security Symbol"])
-    qty = pick(["Quantity", "Qty", "Qty (Quantity)", "Shares", "Units", "Position", "Total Shares"])
-    cost = pick(["Cost Basis", "Total Cost Basis", "Total Cost", "Cost"])
-
-    if not sym or not qty or not cost:
-        raise ValueError(
-            "Could not detect required columns in schwab_positions.csv.\n"
-            f"Found header: {header}\n"
-            "Need something like Symbol/Ticker, Quantity/Shares, Cost Basis."
-        )
-    return sym, qty, cost
+    if len(suffixes) > 1:
+        raise ValueError(f"Lot files span multiple account suffixes: {sorted(suffixes)}")
+    return next(iter(suffixes))
 
 
-def load_positions_summary(path: Path) -> Dict[str, Dict[str, Decimal]]:
+def build_output_paths(account_name: Optional[str]) -> Tuple[Path, Path, Path]:
+    if not account_name:
+        return OUT_CHECKLIST, OUT_SUBTOTALS, OUT_VALIDATION
+
+    slug = slugify_account_name(account_name)
+    return (
+        Path(f"{slug}_quicken_addshares_checklist.csv"),
+        Path(f"{slug}_quicken_security_subtotals.csv"),
+        Path(f"{slug}_schwab_quicken_validation_report.csv"),
+    )
+
+
+def load_positions_summary(path: Path) -> Tuple[Dict[str, Dict[str, Decimal]], Optional[str]]:
     """
-    Returns per-symbol totals from Schwab positions CSV:
+    Returns per-symbol totals from the Quicken_Lots workbook for the account
+    matching the lot file account suffix:
       { "AAPL": {"shares":..., "cost":...}, ... }
     """
     out: Dict[str, Dict[str, Decimal]] = {}
-    
-    # Read raw rows to skip title/blank rows like lot files
-    text = path.read_text(encoding="utf-8-sig")
-    rows = list(csv.reader(text.splitlines()))
-    if not rows:
-        return out
-    
-    # Find header row containing Symbol, Quantity, Cost Basis
-    header_idx = None
-    for i, r in enumerate(rows):
-        row_stripped = [c.strip() for c in r]
-        # Look for a row that has Symbol-like and Quantity-like columns
-        has_symbol = any("symbol" in c.lower() or "ticker" in c.lower() for c in row_stripped)
-        has_qty = any("quantity" in c.lower() or "qty" in c.lower() or "shares" in c.lower() for c in row_stripped)
-        has_cost = any("cost basis" in c.lower() or "cost" in c.lower() for c in row_stripped)
-        if has_symbol and has_qty and has_cost:
-            header_idx = i
-            break
-    
-    if header_idx is None:
-        return out
-    
-    header = rows[header_idx]
-    sym_col, qty_col, cost_col = detect_positions_columns(list(header))
-    
-    # Create dict reader manually from remaining rows
-    idx = {h.strip(): i for i, h in enumerate(header)}
-    
-    for r in rows[header_idx + 1:]:
-        if not r or all((c or "").strip() == "" for c in r):
+
+    account_suffix = detect_account_suffix_from_lot_files(sorted(LOTS_DIR.glob("*.csv")))
+    if not account_suffix:
+        raise ValueError("Could not determine account suffix from lot file titles.")
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    current_account_matches = False
+    matched_account_name: Optional[str] = None
+
+    for row in ws.iter_rows(values_only=True):
+        cells = list(row[:7])
+        while len(cells) < 7:
+            cells.append(None)
+
+        name = str(cells[1]).strip() if cells[1] is not None else ""
+        symbol = str(cells[2]).strip().upper() if cells[2] is not None else ""
+        shares_val = cells[4]
+        cost_val = cells[6]
+
+        # Quicken reports cash as a row named "Cash" without a ticker symbol.
+        if current_account_matches and name.lower() == "cash":
+            out["CASH"] = {
+                "shares": Decimal("0"),
+                "cost": parse_decimal_any(cost_val),
+            }
             continue
-        
-        sym_val = r[idx[sym_col]].strip().upper() if idx[sym_col] < len(r) else ""
-        if not sym_val:
+
+        # Account summary/header row, e.g. "Estate 3993"
+        if name and not symbol and shares_val is None:
+            digits = "".join(ch for ch in name if ch.isdigit())
+            current_account_matches = bool(digits) and digits.endswith(account_suffix)
+            if current_account_matches:
+                matched_account_name = name
             continue
-        
-        # Skip summary/total rows
-        if sym_val in ("ACCOUNT TOTAL", "CASH & CASH INVESTMENTS", "TOTAL", "TOTALS", "GRAND TOTAL"):
+
+        if not current_account_matches:
             continue
-        
-        qty_val = r[idx[qty_col]] if idx[qty_col] < len(r) else "0"
-        cost_val = r[idx[cost_col]] if idx[cost_col] < len(r) else "0"
-        
-        shares = parse_decimal_any(qty_val)
-        cost = parse_decimal_any(cost_val)
-        out[sym_val] = {"shares": shares, "cost": cost}
-    
-    return out
+
+        if not symbol:
+            continue
+
+        # Keep only per-security summary rows, not lot-detail rows.
+        if shares_val is None:
+            continue
+
+        if symbol in ("TOTAL", "TOTALS"):
+            continue
+
+        out[symbol] = {
+            "shares": parse_decimal_any(shares_val),
+            "cost": parse_decimal_any(cost_val),
+        }
+
+    wb.close()
+    return out, matched_account_name
 
 
 def write_validation_report(
-    schwab_pos: Dict[str, Dict[str, Decimal]],
-    lot_totals: Dict[str, Dict[str, Decimal]],
+    quicken_pos: Dict[str, Dict[str, Decimal]],
+    schwab_lot_totals: Dict[str, Dict[str, Decimal]],
+    output_path: Path,
 ) -> None:
     """
     Writes per-symbol diffs and a status column.
     """
-    symbols = sorted(set(schwab_pos.keys()) | set(lot_totals.keys()))
+    symbols = sorted(set(quicken_pos.keys()) | set(schwab_lot_totals.keys()))
     rows = []
     for sym in symbols:
-        s = schwab_pos.get(sym)
-        q = lot_totals.get(sym)
+        q = quicken_pos.get(sym)
+        s = schwab_lot_totals.get(sym)
 
-        s_sh = s["shares"] if s else None
-        s_cost = s["cost"] if s else None
         q_sh = q["shares"] if q else None
         q_cost = q["cost"] if q else None
+        s_sh = s["shares"] if s else None
+        s_cost = s["cost"] if s else None
 
-        sh_diff = (q_sh - s_sh) if (q_sh is not None and s_sh is not None) else None
-        cost_diff = (q_cost - s_cost) if (q_cost is not None and s_cost is not None) else None
+        sh_diff = (s_sh - q_sh) if (q_sh is not None and s_sh is not None) else None
+        cost_diff = (s_cost - q_cost) if (q_cost is not None and s_cost is not None) else None
 
         status = "OK"
-        if s is None:
-            status = "MISSING_IN_SCHWAB_POSITIONS"
-        elif q is None:
-            status = "MISSING_IN_LOT_FILES"
+        if q is None:
+            status = "MISSING_IN_QUICKEN"
+        elif s is None:
+            status = "MISSING_IN_SCHWAB_LOTS"
         else:
             # Tolerances: shares exact (to 0.0001), cost within $0.01
             if sh_diff is not None and cost_diff is not None:
@@ -469,19 +538,19 @@ def write_validation_report(
 
         rows.append({
             "Symbol": sym,
+            "QuickenShares": "" if q_sh is None else str(q_sh),
             "SchwabShares": "" if s_sh is None else str(s_sh),
-            "LotsShares": "" if q_sh is None else str(q_sh),
-            "ShareDiff(Lots-Schwab)": "" if sh_diff is None else str(sh_diff),
+            "ShareDiff(Schwab-Quicken)": "" if sh_diff is None else str(sh_diff),
+            "QuickenCostBasis": "" if q_cost is None else str(q_cost),
             "SchwabCostBasis": "" if s_cost is None else str(s_cost),
-            "LotsCostBasis": "" if q_cost is None else str(q_cost),
-            "CostDiff(Lots-Schwab)": "" if cost_diff is None else str(cost_diff),
+            "CostDiff(Schwab-Quicken)": "" if cost_diff is None else str(cost_diff),
             "Status": status,
         })
 
-    with OUT_VALIDATION.open("w", newline="", encoding="utf-8") as f:
+    with output_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [
-            "Symbol","SchwabShares","LotsShares","ShareDiff(Lots-Schwab)","SchwabCostBasis",
-            "LotsCostBasis","CostDiff(Lots-Schwab)","Status"
+            "Symbol","QuickenShares","SchwabShares","ShareDiff(Schwab-Quicken)","QuickenCostBasis",
+            "SchwabCostBasis","CostDiff(Schwab-Quicken)","Status"
         ])
         w.writeheader()
         w.writerows(rows)
@@ -491,8 +560,8 @@ def write_validation_report(
 # Writers
 # -------------------------
 
-def write_checklist(rows: List[AggRow]) -> None:
-    with OUT_CHECKLIST.open("w", newline="", encoding="utf-8") as f:
+def write_checklist(rows: List[AggRow], output_path: Path) -> None:
+    with output_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
             fieldnames=["Symbol", "Bucket", "Shares", "TotalCost", "AcqDateForQuicken", "LotsInBucket", "Memo"],
@@ -513,9 +582,10 @@ def write_checklist(rows: List[AggRow]) -> None:
 def write_subtotals(
     totals: Dict[str, Dict[str, Decimal]],
     counts: Dict[str, Dict[str, int]],
+    output_path: Path,
 ) -> None:
     syms = sorted(totals.keys())
-    with OUT_SUBTOTALS.open("w", newline="", encoding="utf-8") as f:
+    with output_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
             fieldnames=["Symbol", "TotalShares", "TotalCostBasis", "LotFilesRead", "LotsRead", "BucketRowsEmitted"],
@@ -547,24 +617,35 @@ def main() -> None:
         raise SystemExit("No CSV files found in ./lots/")
 
     agg_rows, per_symbol_totals, per_symbol_counts = aggregate_all(lot_files)
+    account_suffix = detect_account_suffix_from_lot_files(lot_files)
+    account_name = f"account_{account_suffix}" if account_suffix else None
 
-    write_checklist(agg_rows)
-    write_subtotals(per_symbol_totals, per_symbol_counts)
+    if POSITIONS_SUMMARY_FILE.exists():
+        _, workbook_account_name = load_positions_summary(POSITIONS_SUMMARY_FILE)
+        if workbook_account_name:
+            account_name = workbook_account_name
+
+    checklist_path, subtotals_path, validation_path = build_output_paths(account_name)
+
+    write_checklist(agg_rows, checklist_path)
+    write_subtotals(per_symbol_totals, per_symbol_counts, subtotals_path)
 
     # Optional validation
     if POSITIONS_SUMMARY_FILE.exists():
-        schwab_pos = load_positions_summary(POSITIONS_SUMMARY_FILE)
-        write_validation_report(schwab_pos, per_symbol_totals)
-        validation_msg = f"Validation written: {OUT_VALIDATION}"
+        schwab_pos, workbook_account_name = load_positions_summary(POSITIONS_SUMMARY_FILE)
+        if workbook_account_name:
+            checklist_path, subtotals_path, validation_path = build_output_paths(workbook_account_name)
+        write_validation_report(schwab_pos, per_symbol_totals, validation_path)
+        validation_msg = f"Validation written: {validation_path}"
     else:
         # Still emit an empty-ish report that says skipped (handy reminder)
-        with OUT_VALIDATION.open("w", newline="", encoding="utf-8") as f:
-            f.write("Validation skipped: file schwab_positions.csv not found in current folder.\n")
-        validation_msg = "Validation skipped (no schwab_positions.csv); stub report written."
+        with validation_path.open("w", newline="", encoding="utf-8") as f:
+            f.write("Validation skipped: file Quicken_Lots.xlsx not found in current folder.\n")
+        validation_msg = "Validation skipped (no Quicken_Lots.xlsx); stub report written."
 
     print(f"Read lot files: {len(lot_files)} from ./{LOTS_DIR}/")
-    print(f"Wrote checklist: {OUT_CHECKLIST} ({len(agg_rows)} Add-Shares lines)")
-    print(f"Wrote subtotals: {OUT_SUBTOTALS} ({len(per_symbol_totals)} securities)")
+    print(f"Wrote checklist: {checklist_path} ({len(agg_rows)} Add-Shares lines)")
+    print(f"Wrote subtotals: {subtotals_path} ({len(per_symbol_totals)} securities)")
     print(validation_msg)
 
 

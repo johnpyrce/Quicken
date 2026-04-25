@@ -9,15 +9,15 @@ Investment cost basis in Quicken becomes corrupted due to OFX download issues, p
 ## Architecture: Three-Stage Pipeline
 
 ```
-1. DATA ACQUISITION (scrape_schwab_lots.py)
+1. DATA ACQUISITION (../scrape_schwab_lots.py)
    Schwab Website → Playwright CDP → ./lots-{account}/*.csv (per-ticker lot files)
    
-2. DATA TRANSFORMATION (schwab_quicken_rebuild.py)  
+2. DATA TRANSFORMATION (../schwab_quicken_rebuild.py)  
    ./lots/*.csv → Lot bucketing by age → quicken_addshares_checklist.csv
                                       → quicken_security_subtotals.csv
                                       → schwab_quicken_validation_report.csv
    
-3. VALIDATION (basis.py)
+3. VALIDATION (../basis.py)
    Quicken_Lots.csv + ./lots/*.csv → Lot-by-lot comparison → Console discrepancy report
 ```
 
@@ -25,7 +25,7 @@ Investment cost basis in Quicken becomes corrupted due to OFX download issues, p
 
 ### Primary Workflow Scripts
 
-**[scrape_schwab_lots.py](scrape_schwab_lots.py)** - Playwright CDP automation for bulk lot export (RECOMMENDED)
+**[scrape_schwab_lots.py](../scrape_schwab_lots.py)** - Playwright CDP automation for bulk lot export (PRIMARY TOOL)
 - Connects to existing Chrome browser via CDP (Chrome DevTools Protocol)
 - User must log in to Schwab manually first (avoids bot detection)
 - Automatically discovers and processes **all securities** in specified account
@@ -34,14 +34,14 @@ Investment cost basis in Quicken becomes corrupted due to OFX download issues, p
 - **Dependencies**: `playwright` only
 - **Prerequisites**: Chrome running with `--remote-debugging-port=9222`
 - **Advantages**: Works with existing session, avoids bot detection, robust error handling, processes all securities automatically
-- **Limitations**: Requires Chrome debug port setup, cannot launch browser automatically
+- **Limitations**: Requires Chrome debug port setup, requires manual directory rename to `lots/` before running rebuild script
 
-**[schwab_quicken_rebuild.py](schwab_quicken_rebuild.py)** - Primary transformation engine (CURRENT PRODUCTION SCRIPT)
+**[schwab_quicken_rebuild.py](../schwab_quicken_rebuild.py)** - Primary transformation engine (CURRENT PRODUCTION SCRIPT)
 - Reads **all** CSV files from `./lots/` directory
 - Groups lots into 4 time-based buckets per security:
   - `VERY_OLD`: acquired < 2020-01-01 → Quicken date: 12/31/2019
   - `OLD`: 2020 ≤ acq < 2023-01-01 → Quicken date: 12/31/2022
-  - `LONG_RECENT`: 2023 ≤ acq < (as_of - 365d) → Quicken date: 12/31/2024
+  - `LONG_RECENT`: 2023 ≤ acq < (as_of - 365d) → Quicken date: 12/31/2025
   - `SHORT_TERM`: acq ≥ (as_of - 365d) → Quicken date: **file's as_of_date**
 - Outputs:
   - `quicken_addshares_checklist.csv`: Manual entry template (4 rows per security max)
@@ -50,7 +50,7 @@ Investment cost basis in Quicken becomes corrupted due to OFX download issues, p
 - **Usage**: `python schwab_quicken_rebuild.py`
 - **No parameters required** - processes entire `./lots/` directory automatically
 
-**[basis.py](basis.py)** - Legacy lot-by-lot comparison tool
+**[basis.py](../basis.py)** - Legacy lot-by-lot comparison tool
 - Compares Schwab lots against Quicken export for **single ticker**
 - Identifies missing lots, share mismatches, cost basis differences
 - **Usage**: `python basis.py` (auto-discovers all `./lots/*.csv` files)
@@ -59,7 +59,7 @@ Investment cost basis in Quicken becomes corrupted due to OFX download issues, p
 
 ### Supporting Scripts
 
-**[schwab_lot_downloader.py](schwab_lot_downloader.py)** - Selenium automation for bulk lot export (LEGACY)
+**schwab_lot_downloader.py** - Selenium automation for bulk lot export (LEGACY)
 - Opens Chrome with Selenium WebDriver
 - Automates Schwab login (manual 2FA completion required)
 - Navigates to Positions → Cost Basis
@@ -69,20 +69,43 @@ Investment cost basis in Quicken becomes corrupted due to OFX download issues, p
 - **Dependencies**: `selenium`, `webdriver-manager`
 - **Status**: Works but being phased out in favor of `scrape_schwab_lots.py` (CDP-based approach more reliable)
 
-**[schwab_lots_to_quicken_checklist.py](schwab_lots_to_quicken_checklist.py)** - Legacy single-file transformer
+**[schwab_lots_to_quicken_checklist.py](../schwab_lots_to_quicken_checklist.py)** - Legacy single-file transformer
 - Converts one Schwab CSV → checklist with **individual lot rows** (unbucketed)
 - **Usage**: `python schwab_lots_to_quicken_checklist.py AAPL.csv`
 - **Status**: Obsolete - use `schwab_quicken_rebuild.py` instead
 
-**[schwab_scraper.py](schwab_scraper.py)** - Experimental: connects to existing Chrome session
+**schwab_scraper.py** - Experimental: connects to existing Chrome session
 - Requires Chrome launched with `--remote-debugging-port=9222`
 - More fragile than `schwab_lot_downloader.py`
 - **Status**: Proof-of-concept, not recommended for production
 
-**[inspect_schwab.py](inspect_schwab.py)** - Developer tool for HTML structure analysis
+**[inspect_schwab.py](../inspect_schwab.py)** - Developer tool for HTML structure analysis
 - Inspects Schwab page DOM to identify CSS selectors
 - Useful when Schwab changes page structure
 - **Usage**: `python inspect_schwab.py` (with Chrome debugging session open)
+
+## Current Workspace Structure (January 2026)
+
+```
+Quicken/
+├── scrape_schwab_lots.py           # Primary: download lots from Schwab
+├── schwab_quicken_rebuild.py       # Primary: bucket lots and generate checklist
+├── basis.py                        # Validation: compare Quicken vs Schwab
+├── lots-Inheritance/               # Raw Schwab downloads (32 CSV files)
+│   ├── AAPL.csv
+│   ├── GOOGL.csv
+│   └── ... (one per security)
+├── orig_lots/                      # Backup of previous downloads
+├── lots/                           # Working directory (manual copy/rename)
+├── schwab_positions.csv            # Manual Schwab positions export
+├── Quicken_Lots.csv                # Manual Quicken export for validation
+├── quicken_addshares_checklist.csv # Generated: manual entry template
+├── quicken_security_subtotals.csv  # Generated: totals per security
+├── schwab_quicken_validation_report.csv  # Generated: discrepancy report
+└── RepairQuickenTransactions.md    # Manual procedure documentation
+```
+
+**Key workflow**: `lots-Inheritance/` → manual rename to `lots/` → `schwab_quicken_rebuild.py` reads `lots/`
 
 ## Critical Data Conventions
 
@@ -105,7 +128,7 @@ Row 4+: 2/16/2024,0.6369,$74.05,$105.45,$31.40,42.41%  ← Lot data
 
 ### Schwab Positions Summary (`schwab_positions.csv`)
 
-**Optional validation file** - used by `schwab_quicken_rebuild.py` to verify aggregate totals.
+**Optional validation file** - used by `../schwab_quicken_rebuild.py` to verify aggregate totals.
 
 **How to export from Schwab**:
 1. Log in to Schwab.com
@@ -141,7 +164,7 @@ Microsoft Corp,MSFT,380.12,5.00,1900.60,1500.00  ← Next security header
 Lot 1/10/2023,,,5.00,,1500.00
 ```
 
-**Parsing logic** (`parse_quicken_lots()` in basis.py):
+**Parsing logic** (`parse_quicken_lots()` in ../basis.py):
 1. Maintain `current_security` state variable
 2. If `name.startswith("Lot ")`: parse as lot detail, append to `current_security.lots[]`
 3. Else: parse as new security header, store in `securities[ticker]`
@@ -195,6 +218,15 @@ python scrape_schwab_lots.py "Joint Account" # Downloads from 'Joint Account'
 - Files: `./lots-Inheritance/AAPL.csv`, `./lots-Inheritance/GOOGL.csv`, etc. (one per holding)
 - Old directory removed and recreated fresh on each run
 
+**Manual step (required)**: Copy or rename the account-specific directory to `lots/` before running rebuild:
+```bash
+# Option 1: Copy files (preserves original)
+cp -r lots-Inheritance/ lots/
+
+# Option 2: Rename directory (recommended)
+mv lots-Inheritance/ lots/
+```
+
 ### 3. Generate Quicken Rebuild Checklist
 
 ```bash
@@ -209,7 +241,7 @@ Wrote subtotals: quicken_security_subtotals.csv (32 securities)
 Validation written: schwab_quicken_validation_report.csv
 ```
 
-**Manual step**: Open `quicken_addshares_checklist.csv` in Excel, manually enter "Add Shares" transactions into Quicken (see [RepairQuickenTransactions.md](RepairQuickenTransactions.md) for complete procedure)
+**Manual step**: Open `quicken_addshares_checklist.csv` in Excel, manually enter "Add Shares" transactions into Quicken (see [RepairQuickenTransactions.md](../RepairQuickenTransactions.md) for complete procedure)
 
 ### 4. Validate Against Quicken (Optional)
 
@@ -226,7 +258,7 @@ python basis.py
 - Workspace: `c:\cygwin64\home\John\Projects\Quicken`
 - Python: `C:\Python314\python.exe` (Windows native, **not** Cygwin Python)
 - Terminal: bash via Cygwin (Git Bash or Cygwin64)
-- Dependencies: `playwright` for scrape_schwab_lots.py, `selenium` for legacy schwab_lot_downloader.py, stdlib for everything else
+- Dependencies: `playwright` for ../scrape_schwab_lots.py, `selenium` for legacy schwab_lot_downloader.py, stdlib for everything else
 
 **Launch config** (F5 debugging):
 ```json
@@ -245,7 +277,7 @@ python basis.py
 
 ## What NOT to Do (Critical Quicken Gotchas)
 
-From [RepairQuickenTransactions.md](RepairQuickenTransactions.md):
+From [RepairQuickenTransactions.md](../RepairQuickenTransactions.md):
 - **NEVER** use Quicken's "Added Shares" or "Removed Shares" actions for rebuilds → Use "Add Shares" transactions instead
 - **NEVER** connect Quicken account to Schwab OFX downloads after manual rebuild → Stay manual forever
 - **NEVER** accept placeholder transactions → Delete and rebuild properly
@@ -267,7 +299,7 @@ return "SHORT_TERM"
 **Quicken acquisition dates** (fixed for long-term buckets, dynamic for short-term):
 - `VERY_OLD` → **12/31/2019** (guarantees long-term status)
 - `OLD` → **12/31/2022** (guarantees long-term status)
-- `LONG_RECENT` → **12/31/2024** (guarantees long-term status **if entered in 2025+**)
+- `LONG_RECENT` → **12/31/2025** (guarantees long-term status **if entered in 2026+**)
 - `SHORT_TERM` → **file's as_of_date** (preserves short-term status for tax purposes)
 
 ### Why These Specific Dates?
@@ -277,7 +309,7 @@ return "SHORT_TERM"
 **Date selection rationale**:
 
 1. **12/31/2019 (VERY_OLD)**:
-   - Any lot acquired before 2020 is guaranteed 5+ years old as of 2025
+   - Any lot acquired before 2020 is guaranteed 6+ years old as of 2026
    - Using year-end avoids mid-year confusion when entering in Quicken
    - Safe margin: even if entered months later, still clearly long-term
 
@@ -286,11 +318,11 @@ return "SHORT_TERM"
    - Separates "really old" from "moderately old" for better granularity
    - Again uses year-end for clean bucketing
 
-3. **12/31/2024 (LONG_RECENT)**:
-   - Most recent year-end before current date (file dated 12/23/2025)
-   - Ensures 1+ year holding period for long-term treatment
-   - **Critical timing**: Must actually enter these in Quicken during 2025 or later
-   - If entered in 2024, these would be <365 days old (short-term) - **update the date if you rebuild in future years**
+3. **12/31/2026 (LONG_RECENT)**:
+   - Most recent year-end (current as of January 2026)
+   - Ensures 1+ year holding period for long-term treatment when entered in 2027+
+   - **Critical timing**: Update this date each year (e.g., 12/31/2027 in 2028)
+   - If you're rebuilding in 2026, lots acquired in 2023-2025 use this date
 
 4. **as_of_date (SHORT_TERM)**:
    - Uses the actual "as of" date from each Schwab CSV file
@@ -298,7 +330,7 @@ return "SHORT_TERM"
    - These are lots likely to be sold soon, so exact acquisition date matters
    - Allows accurate short-term vs long-term distinction when selling specific lots
 
-**Key insight**: The bucketing strategy is **time-sensitive**. The `LONG_RECENT` date (12/31/2024) assumes you're running this in 2025. If you use this script in 2026, you should update `LONG_RECENT` to 12/31/2025 to maintain the >365 day rule.
+**Key insight**: The bucketing strategy is **time-sensitive**. The `LONG_RECENT` date (12/31/2026) is current as of January 2026. Each year, increment this date by one year (e.g., 12/31/2027 for 2027, etc.) to maintain the >365 day rule and ensure long-term capital gains treatment.
 
 **Trade-offs**:
 - ✅ **Benefit**: Aggregation reduces 100+ lot entries to 4 rows per security (massive time savings)
@@ -321,12 +353,12 @@ return "SHORT_TERM"
 ## File Dependency Graph
 
 ```
-scrape_schwab_lots.py [account_name]
+../scrape_schwab_lots.py [account_name]
     ↓ generates
 ./lots-{account}/*.csv (e.g., 32 files in lots-Inheritance/)
-    ↓ manually copy to ./lots/ or update schwab_quicken_rebuild.py path
+    ↓ MANUAL STEP: mv lots-Inheritance/ lots/
     ↓ consumed by
-schwab_quicken_rebuild.py
+../schwab_quicken_rebuild.py (reads from ./lots/)
     ↓ generates
 quicken_addshares_checklist.csv ←─── Manual entry into Quicken
 quicken_security_subtotals.csv       (See RepairQuickenTransactions.md)
@@ -337,23 +369,23 @@ schwab_positions.csv (manual Schwab export: Positions summary)
 Parallel validation path:
 Quicken_Lots.csv (manual Quicken export)
     ↓ consumed by
-basis.py + ./lots/*.csv
+../basis.py + ./lots/*.csv
     ↓ prints
 Console discrepancy report
 
 Legacy alternative:
-schwab_lot_downloader.py → ./lots/*.csv (deprecated, use scrape_schwab_lots.py instead)
+schwab_lot_downloader.py → ./lots/*.csv (deprecated, use ../scrape_schwab_lots.py instead)
 ```
 
 ## Production Script vs Legacy Scripts
 
-**Use `schwab_quicken_rebuild.py`** for actual Quicken rebuilds because:
+**Use `../schwab_quicken_rebuild.py`** for actual Quicken rebuilds because:
 - Processes entire account in one run (not one ticker at a time)
 - Buckets lots to reduce manual entry (4 rows per security vs 100+)
 - Validates totals against Schwab positions export
 - Outputs checklist optimized for manual Quicken entry
 
-**Use `basis.py`** only for:
+**Use `../basis.py`** only for:
 - Post-rebuild validation (lot-by-lot comparison)
 - Debugging individual ticker discrepancies
 - Understanding the original comparison logic
@@ -363,7 +395,7 @@ schwab_lot_downloader.py → ./lots/*.csv (deprecated, use scrape_schwab_lots.py
 - **Type hints everywhere**: Python 3.7+ with full type annotations
 - **Dataclasses for data models**: `@dataclass` for `Lot`, `Security`, `AggRow`
 - **Fail-fast validation**: Check column existence immediately, raise `SystemExit` with helpful message
-- **Decimal vs Float**: `schwab_quicken_rebuild.py` uses `Decimal` for precision; `basis.py` uses `float`
+- **Decimal vs Float**: `../schwab_quicken_rebuild.py` uses `Decimal` for precision; `../basis.py` uses `float`
 - **Path objects**: `Path()` throughout, never string concatenation
 - **CSV robustness**: `encoding="utf-8-sig"`, handle `$`, `,`, `()`, `-`, `*`, `--` in numbers
 - **Date parsing flexibility**: Try multiple formats (`%m/%d/%Y`, `%m/%d/%y`, `%Y-%m-%d`), fallback to regex

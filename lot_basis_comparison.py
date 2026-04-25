@@ -1,9 +1,11 @@
 import csv
 import sys
 import glob
+import re
 from dataclasses import dataclass, field
+from openpyxl import load_workbook
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Set
 
 """
 This script processes a Charles Schwab CSV export of unrealized lots against a Quicken export
@@ -70,11 +72,11 @@ def parse_number(s: str) -> float:
     """Convert Schwab-style numbers like '1,234.56' or '1,234-' or '$1,234.56' to float."""
     if s is None:
         return 0.0
-    s = s.strip()
+    s = str(s).strip()
     if not s or s == '*':
         return 0.0
     # Remove dollar signs and commas
-    s = s.replace("$", "").replace(",", "")
+    s = s.replace("$", "").replace(",", "").replace("*", "")
     # Some brokers use trailing '-' for negatives
     if s.endswith("-") and s[:-1].replace(".", "", 1).isdigit():
         s = "-" + s[:-1]
@@ -84,57 +86,104 @@ def parse_number(s: str) -> float:
         return 0.0
 
 
-def parse_quicken_lots(filepath: str) -> AccountSecurities:
+def extract_account_suffix_from_title(title_line: str) -> Optional[str]:
+    title_line = (title_line or "").strip()
+    m = re.search(r"for\s+\.\.\.(\d{3,4})\b", title_line, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
+
+
+def detect_account_suffix_from_lot_files(paths: List[str]) -> Optional[str]:
+    suffixes: Set[str] = set()
+
+    for path_str in paths:
+        path = Path(path_str)
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8-sig")
+        rows = list(csv.reader(text.splitlines()))
+        if not rows:
+            continue
+        title_line = rows[0][0] if rows[0] else ""
+        suffix = extract_account_suffix_from_title(title_line)
+        if suffix:
+            suffixes.add(suffix)
+
+    if not suffixes:
+        return None
+    if len(suffixes) > 1:
+        raise ValueError(f"Lot files span multiple account suffixes: {sorted(suffixes)}")
+    return next(iter(suffixes))
+
+
+def parse_quicken_lots(filepath: str, stock_files: List[str]) -> AccountSecurities:
     """
-    Parse Quicken Quicken_Lots.csv file into a dictionary indexed by Ticker Symbol.
-    
-    Format:
-    - First line: column headers
-    - Security header line: Name, Ticker Symbol, Quote/Price, Shares, Market Value, Cost Basis
-    - Lot lines: Name starts with "Lot", followed by lot-specific data
-    
-    Returns:
-        dict[str, Security]: Dictionary mapping ticker symbols to Security objects
+    Parse Quicken_Lots.xlsx and return securities for the brokerage account
+    matching the masked suffix in the Schwab lot CSV title lines.
     """
     securities = {}
     current_security = None
-    
-    with open(filepath, "r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        
-        for row in reader:
-            name = row.get("Name", "").strip()
-            ticker = row.get("Ticker Symbol", "").strip()
-            
-            # Skip empty rows
-            if not name:
-                continue
-            
-            # Check if this is a lot line (starts with "Lot")
-            if name.startswith("Lot"):
-                if current_security is not None:
-                    # Parse lot data
-                    lot = Lot(
-                        name=name,
-                        quote=parse_number(row.get("Quote/Price", "")),
-                        shares=parse_number(row.get("Shares", "")),
-                        market_value=parse_number(row.get("Market Value", "")),
-                        cost_basis=parse_number(row.get("Cost Basis", "")),
-                    )
-                    current_security.lots.append(lot)
-            else:
-                # This is a new security header
-                current_security = Security(
+
+    account_suffix = detect_account_suffix_from_lot_files(stock_files)
+    if not account_suffix:
+        raise SystemExit("Could not determine account suffix from Schwab lot file titles.")
+
+    wb = load_workbook(filepath, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    current_account_matches = False
+    matched_account_name = None
+
+    for row in ws.iter_rows(values_only=True):
+        cells = list(row[:7])
+        while len(cells) < 7:
+            cells.append(None)
+
+        name = str(cells[1]).strip() if cells[1] is not None else ""
+        ticker = str(cells[2]).strip() if cells[2] is not None else ""
+        quote = parse_number(cells[3]) if cells[3] is not None else 0.0
+        shares = parse_number(cells[4]) if cells[4] is not None else 0.0
+        market_value = parse_number(cells[5]) if cells[5] is not None else 0.0
+        cost_basis = parse_number(cells[6]) if cells[6] is not None else 0.0
+
+        # Account summary/header row, e.g. "Estate 3993"
+        if name and not ticker and cells[4] is None:
+            digits = "".join(ch for ch in name if ch.isdigit())
+            current_account_matches = bool(digits) and digits.endswith(account_suffix)
+            if current_account_matches:
+                matched_account_name = name
+            current_security = None
+            continue
+
+        if not current_account_matches or not name:
+            continue
+
+        if name.startswith("Lot"):
+            if current_security is not None:
+                lot = Lot(
                     name=name,
-                    ticker=ticker,
-                    quote=parse_number(row.get("Quote/Price", "")),
-                    shares=parse_number(row.get("Shares", "")),
-                    market_value=parse_number(row.get("Market Value", "")),
-                    cost_basis=parse_number(row.get("Cost Basis", "")),
+                    quote=quote,
+                    shares=shares,
+                    market_value=market_value,
+                    cost_basis=cost_basis,
                 )
-                if ticker:  # Only store if ticker exists
-                    securities[ticker] = current_security
-    
+                current_security.lots.append(lot)
+        else:
+            current_security = Security(
+                name=name,
+                ticker=ticker,
+                quote=quote,
+                shares=shares,
+                market_value=market_value,
+                cost_basis=cost_basis,
+            )
+            if ticker:
+                securities[ticker] = current_security
+
+    wb.close()
+    if matched_account_name:
+        print(f"Using Quicken account: {matched_account_name}")
     return securities
 
 
@@ -421,7 +470,7 @@ def stock_lots(securities: AccountSecurities, stock_lots_file: str):
 
 
 if __name__ == "__main__":
-    quicken_lots = 'Quicken_Lots.csv'
+    quicken_lots = 'Quicken_Lots.xlsx'
     lots_dir = 'lots'
     
     # Get list of stock CSV files to process
@@ -452,7 +501,7 @@ if __name__ == "__main__":
         sys.exit(1)
     
     print(f"\n=== Parsing {quicken_lots_file} ===")
-    securities = parse_quicken_lots(str(quicken_lots_file))
+    securities = parse_quicken_lots(str(quicken_lots_file), stock_files)
     print(f"Found {len(securities)} securities in Quicken\n")
     
     for ticker, data in securities.items():
