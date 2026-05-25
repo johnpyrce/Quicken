@@ -9,3 +9,6 @@ orig_lots/
 # Data files
 *.csv
 *.xlsx
+
+# exports
+Exports/
