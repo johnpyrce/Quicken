@@ -1,51 +1,25 @@
+import argparse
 import csv
-import sys
-import glob
 import re
 from dataclasses import dataclass, field
-from openpyxl import load_workbook
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Optional
 
-"""
-This script processes a Charles Schwab CSV export of unrealized lots against a Quicken export
-to create a Quicken rebuild template CSV with individual "Add Shares" transactions for each lot.
-To use this script:
-1. Export your unrealized lots from Schwab as a CSV file.
-2. Adjust the CONFIG dictionary below to match the column names in your Schwab CSV.
-3. Run this script. It will generate a CSV file named 'quicken_rebuild_template.csv'.
-4. Import the generated CSV into Quicken to rebuild your cost basis.
+SCHWAB_LOTS_DIR = Path("SchwabLots")
+QUICKEN_EXPORTS_DIR = Path("QuickenExports")
+QUICKEN_LOTS_RE = re.compile(r"^QuickenLots_(\d{4}-\d{2}-\d{2})\.xlsx$")
 
-The Estate_logs.csv file has this format:
-Field Names:
-- Security Description
-- Symbol 
-- Account Name
-- Acquired Date
-- Quantity
-- Cost Basis
-- Total Cost
-
-"""
-
-# ==== CONFIGURE THESE TO MATCH YOUR SCHWAB CSV COLUMN NAMES ====
-# Open your Schwab CSV in Excel/Notepad and adjust these strings
-CONFIG = {
-    "security_col": "Security Description",   # e.g. "Security Description" or "Description"
-    "symbol_col": "Symbol",                  # e.g. "Symbol" or "Ticker"
-    "account_col": "Account Name",           # If not present, you can set this to None
-    "acquired_date_col": "Acquired Date",    # e.g. "Acquired Date" or "Purchase Date"
-    "shares_col": "Quantity",                # e.g. "Quantity" or "Shares"
-    "cost_basis_col": "Cost Basis",          # e.g. "Cost Basis" or "Total Cost"
-}
-
-INPUT_CSV = "schwab_unrealized_lots.csv"      # <-- change to your Schwab CSV file name
-OUTPUT_CSV = "quicken_rebuild_template.csv"   # output file
+SYMBOL_COL = "Symbol"
+OPEN_DATE_COL = "Open Date"
+QUANTITY_COL = "Quantity"
+COST_BASIS_COL = "Cost Basis"
 
 
 @dataclass
 class Lot:
     """Represents a single lot of shares within a security."""
+
     name: str
     quote: float = 0.0
     shares: float = 0.0
@@ -55,121 +29,300 @@ class Lot:
 
 @dataclass
 class Security:
-    """Represents a security with its total holdings and individual lots."""
+    """Represents a Quicken security with totals and individual lots."""
+
     name: str
     ticker: str
     quote: float = 0.0
     shares: float = 0.0
     market_value: float = 0.0
     cost_basis: float = 0.0
-    lots: List[Lot] = field(default_factory=list)
-
-# An account is a list of securities, indexed by ticker symbol
-AccountSecurities = dict[str, Security ]
+    lots: list[Lot] = field(default_factory=list)
 
 
-def parse_number(s: str) -> float:
-    """Convert Schwab-style numbers like '1,234.56' or '1,234-' or '$1,234.56' to float."""
-    if s is None:
+@dataclass
+class AccountSecurities:
+    securities: dict[str, Security]
+    account_name: Optional[str]
+
+
+@dataclass
+class SchwabLots:
+    path: Path
+    account_suffix: Optional[str]
+    lots_by_symbol: dict[str, dict[str, dict[str, float]]]
+
+
+@dataclass
+class LotComparison:
+    """Result of comparing a lot between Schwab and Quicken."""
+
+    date: str
+    schwab_shares: float = 0.0
+    quicken_shares: float = 0.0
+    schwab_cost_basis: float = 0.0
+    quicken_cost_basis: float = 0.0
+    status: str = ""
+
+    def __str__(self) -> str:
+        if self.status == "match":
+            return f"  OK {self.date}: {self.schwab_shares:.4f} shares @ ${self.schwab_cost_basis:.2f}"
+        if self.status == "missing_in_quicken":
+            return (
+                f"  MISSING IN QUICKEN - {self.date}: "
+                f"Schwab has {self.schwab_shares:.4f} shares @ ${self.schwab_cost_basis:.2f}"
+            )
+        if self.status == "missing_in_schwab":
+            return (
+                f"  MISSING IN SCHWAB - {self.date}: "
+                f"Quicken has {self.quicken_shares:.4f} shares @ ${self.quicken_cost_basis:.2f}"
+            )
+
+        shares_diff = (
+            f" shares: {self.schwab_shares:.4f} vs {self.quicken_shares:.4f}"
+            if abs(self.schwab_shares - self.quicken_shares) > 0.01
+            else ""
+        )
+        cost_diff = (
+            f" cost: ${self.schwab_cost_basis:.2f} vs ${self.quicken_cost_basis:.2f}"
+            if abs(self.schwab_cost_basis - self.quicken_cost_basis) > 0.01
+            else ""
+        )
+        return f"  MISMATCH - {self.date}:{shares_diff}{cost_diff}"
+
+
+def parse_number(value) -> float:
+    """Convert Schwab/Quicken formatted numbers to floats."""
+    if value is None:
         return 0.0
-    s = str(s).strip()
-    if not s or s == '*':
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    if not text or text == "*":
         return 0.0
-    # Remove dollar signs and commas
-    s = s.replace("$", "").replace(",", "").replace("*", "")
-    # Some brokers use trailing '-' for negatives
-    if s.endswith("-") and s[:-1].replace(".", "", 1).isdigit():
-        s = "-" + s[:-1]
+
+    text = text.replace("$", "").replace(",", "").replace("*", "").strip()
+    text = re.sub(r"\s+\d+$", "", text)
+
+    negative = False
+    if text.startswith("(") and text.endswith(")"):
+        negative = True
+        text = text[1:-1].strip()
+    if text.endswith("-"):
+        negative = True
+        text = text[:-1].strip()
+
     try:
-        return float(s)
+        parsed = float(text)
     except ValueError:
         return 0.0
+    return -parsed if negative else parsed
 
 
-def extract_account_suffix_from_title(title_line: str) -> Optional[str]:
-    title_line = (title_line or "").strip()
-    m = re.search(r"for\s+\.\.\.(\d{3,4})\b", title_line, re.IGNORECASE)
-    if m:
-        return m.group(1)
+def normalize_date(value) -> Optional[str]:
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return f"{value.month}/{value.day}/{value.year}"
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+            return f"{parsed.month}/{parsed.day}/{parsed.year}"
+        except ValueError:
+            pass
+
+    parts = text.split("/")
+    if len(parts) == 3:
+        try:
+            year = int(parts[2])
+            if year < 100:
+                year += 2000
+            return f"{int(parts[0])}/{int(parts[1])}/{year}"
+        except ValueError:
+            return None
+
     return None
 
 
-def detect_account_suffix_from_lot_files(paths: List[str]) -> Optional[str]:
-    suffixes: Set[str] = set()
+def sortable_date(date_text: str) -> tuple[int, int, int]:
+    month, day, year = (int(part) for part in date_text.split("/"))
+    return year, month, day
 
-    for path_str in paths:
-        path = Path(path_str)
-        if not path.exists():
+
+def extract_account_suffix_from_title(title_line: str) -> Optional[str]:
+    match = re.search(r"for\s+\.\.\.(\d{3,4})\b", (title_line or "").strip(), re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def find_schwab_lot_file() -> Path:
+    if not SCHWAB_LOTS_DIR.exists():
+        raise SystemExit(f"ERROR: Schwab lots directory not found: {SCHWAB_LOTS_DIR.resolve()}")
+
+    paths = sorted(SCHWAB_LOTS_DIR.glob("*.csv"))
+    if not paths:
+        raise SystemExit(f"ERROR: No Schwab lots CSV files found in {SCHWAB_LOTS_DIR.resolve()}")
+    if len(paths) > 1:
+        listed = "\n".join(f"  - {path}" for path in paths)
+        raise SystemExit(
+            "ERROR: Expected exactly one combined Schwab lots CSV in "
+            f"{SCHWAB_LOTS_DIR.resolve()}, found {len(paths)}:\n{listed}"
+        )
+    return paths[0]
+
+
+def find_latest_quicken_lots_file() -> Path:
+    if not QUICKEN_EXPORTS_DIR.exists():
+        raise SystemExit(f"ERROR: Quicken exports directory not found: {QUICKEN_EXPORTS_DIR.resolve()}")
+
+    dated_paths: list[tuple[datetime, Path]] = []
+    for path in QUICKEN_EXPORTS_DIR.glob("QuickenLots_*.xlsx"):
+        match = QUICKEN_LOTS_RE.match(path.name)
+        if not match:
             continue
-        text = path.read_text(encoding="utf-8-sig")
-        rows = list(csv.reader(text.splitlines()))
-        if not rows:
-            continue
-        title_line = rows[0][0] if rows[0] else ""
-        suffix = extract_account_suffix_from_title(title_line)
-        if suffix:
-            suffixes.add(suffix)
+        dated_paths.append((datetime.strptime(match.group(1), "%Y-%m-%d"), path))
 
-    if not suffixes:
-        return None
-    if len(suffixes) > 1:
-        raise ValueError(f"Lot files span multiple account suffixes: {sorted(suffixes)}")
-    return next(iter(suffixes))
+    if not dated_paths:
+        raise SystemExit(
+            "ERROR: No Quicken lots workbook found. Expected files like "
+            f"{QUICKEN_EXPORTS_DIR / 'QuickenLots_YYYY-MM-DD.xlsx'}"
+        )
+
+    return max(dated_paths, key=lambda item: item[0])[1]
 
 
-def parse_quicken_lots(filepath: str, stock_files: List[str]) -> AccountSecurities:
-    """
-    Parse Quicken_Lots.xlsx and return securities for the brokerage account
-    matching the masked suffix in the Schwab lot CSV title lines.
-    """
-    securities = {}
-    current_security = None
-
-    account_suffix = detect_account_suffix_from_lot_files(stock_files)
-    if not account_suffix:
-        raise SystemExit("Could not determine account suffix from Schwab lot file titles.")
-
-    wb = load_workbook(filepath, read_only=True, data_only=True)
-    ws = wb[wb.sheetnames[0]]
-
-    current_account_matches = False
-    matched_account_name = None
-
-    for row in ws.iter_rows(values_only=True):
-        cells = list(row[:7])
-        while len(cells) < 7:
-            cells.append(None)
-
-        name = str(cells[1]).strip() if cells[1] is not None else ""
-        ticker = str(cells[2]).strip() if cells[2] is not None else ""
-        quote = parse_number(cells[3]) if cells[3] is not None else 0.0
-        shares = parse_number(cells[4]) if cells[4] is not None else 0.0
-        market_value = parse_number(cells[5]) if cells[5] is not None else 0.0
-        cost_basis = parse_number(cells[6]) if cells[6] is not None else 0.0
-
-        # Account summary/header row, e.g. "Estate 3993"
-        if name and not ticker and cells[4] is None:
-            digits = "".join(ch for ch in name if ch.isdigit())
-            current_account_matches = bool(digits) and digits.endswith(account_suffix)
-            if current_account_matches:
-                matched_account_name = name
-            current_security = None
-            continue
-
-        if not current_account_matches or not name:
-            continue
-
-        if name.startswith("Lot"):
-            if current_security is not None:
-                lot = Lot(
-                    name=name,
-                    quote=quote,
-                    shares=shares,
-                    market_value=market_value,
-                    cost_basis=cost_basis,
+def find_header_row(rows: list[list[str]]) -> tuple[int, list[str]]:
+    for index, row in enumerate(rows):
+        normalized = [cell.strip() for cell in row]
+        if SYMBOL_COL in normalized and OPEN_DATE_COL in normalized:
+            missing = [
+                column
+                for column in (SYMBOL_COL, OPEN_DATE_COL, QUANTITY_COL, COST_BASIS_COL)
+                if column not in normalized
+            ]
+            if missing:
+                raise SystemExit(
+                    "ERROR: Schwab lots file is missing required column(s): "
+                    + ", ".join(missing)
                 )
-                current_security.lots.append(lot)
-        else:
+            return index, normalized
+
+    raise SystemExit(
+        "ERROR: Could not find the combined Schwab lots header row with "
+        f"{SYMBOL_COL!r} and {OPEN_DATE_COL!r}."
+    )
+
+
+def add_lot(lots: dict[str, dict[str, float]], date_text: str, shares: float, cost: float) -> None:
+    if date_text not in lots:
+        lots[date_text] = {"shares": 0.0, "cost_basis": 0.0}
+    lots[date_text]["shares"] += shares
+    lots[date_text]["cost_basis"] += cost
+
+
+def load_schwab_lots(path: Path) -> SchwabLots:
+    text = path.read_text(encoding="utf-8-sig")
+    rows = list(csv.reader(text.splitlines()))
+    if not rows:
+        raise SystemExit(f"ERROR: Schwab lots file is empty: {path.resolve()}")
+
+    title_line = rows[0][0] if rows[0] else ""
+    account_suffix = extract_account_suffix_from_title(title_line)
+    header_index, headers = find_header_row(rows)
+
+    lots_by_symbol: dict[str, dict[str, dict[str, float]]] = {}
+    for row in rows[header_index + 1 :]:
+        if not any(cell.strip() for cell in row):
+            continue
+        values = dict(zip(headers, row))
+        symbol = values.get(SYMBOL_COL, "").strip().upper()
+        open_date = values.get(OPEN_DATE_COL, "").strip()
+        quantity = values.get(QUANTITY_COL, "").strip()
+
+        if not symbol or symbol == "CASH":
+            continue
+        if not open_date or open_date.lower() == "total" or not quantity:
+            continue
+
+        date_text = normalize_date(open_date)
+        if not date_text:
+            continue
+
+        shares = parse_number(quantity)
+        cost = parse_number(values.get(COST_BASIS_COL, ""))
+        if abs(shares) < 1e-9:
+            continue
+
+        add_lot(lots_by_symbol.setdefault(symbol, {}), date_text, shares, cost)
+
+    if not lots_by_symbol:
+        raise SystemExit(f"ERROR: No stock lots found in combined Schwab file: {path.resolve()}")
+
+    return SchwabLots(path=path, account_suffix=account_suffix, lots_by_symbol=lots_by_symbol)
+
+
+def parse_quicken_lots(path: Path, account_suffix: Optional[str]) -> AccountSecurities:
+    """
+    Parse the latest Quicken lots workbook and return securities for the account
+    matching the Schwab masked suffix.
+    """
+    if not account_suffix:
+        raise SystemExit("ERROR: Could not determine account suffix from the Schwab lots title line.")
+
+    from openpyxl import load_workbook
+
+    securities: dict[str, Security] = {}
+    current_security: Optional[Security] = None
+    current_account_matches = False
+    matched_account_name: Optional[str] = None
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb[wb.sheetnames[0]]
+
+        for row in ws.iter_rows(values_only=True):
+            cells = list(row[:7])
+            while len(cells) < 7:
+                cells.append(None)
+
+            name = str(cells[1]).strip() if cells[1] is not None else ""
+            ticker = str(cells[2]).strip().upper() if cells[2] is not None else ""
+            quote = parse_number(cells[3])
+            shares = parse_number(cells[4])
+            market_value = parse_number(cells[5])
+            cost_basis = parse_number(cells[6])
+
+            # Account summary/header row, e.g. "Estate 3993".
+            if name and not ticker and cells[4] is None:
+                digits = "".join(ch for ch in name if ch.isdigit())
+                current_account_matches = bool(digits) and digits.endswith(account_suffix)
+                if current_account_matches:
+                    matched_account_name = name
+                current_security = None
+                continue
+
+            if not current_account_matches or not name:
+                continue
+
+            if name.startswith("Lot"):
+                if current_security is not None:
+                    current_security.lots.append(
+                        Lot(
+                            name=name,
+                            quote=quote,
+                            shares=shares,
+                            market_value=market_value,
+                            cost_basis=cost_basis,
+                        )
+                    )
+                continue
+
             current_security = Security(
                 name=name,
                 ticker=ticker,
@@ -180,395 +333,196 @@ def parse_quicken_lots(filepath: str, stock_files: List[str]) -> AccountSecuriti
             )
             if ticker:
                 securities[ticker] = current_security
+    finally:
+        wb.close()
 
-    wb.close()
-    if matched_account_name:
-        print(f"Using Quicken account: {matched_account_name}")
-    return securities
+    if not matched_account_name:
+        raise SystemExit(
+            "ERROR: Could not find a Quicken account ending in Schwab account suffix "
+            f"{account_suffix}."
+        )
 
-
-@dataclass
-class LotComparison:
-    """Result of comparing a lot between Schwab and Quicken."""
-    date: str
-    schwab_shares: float = 0.0
-    quicken_shares: float = 0.0
-    schwab_cost_basis: float = 0.0
-    quicken_cost_basis: float = 0.0
-    status: str = ""  # "match", "missing_in_quicken", "missing_in_schwab", "mismatch"
-    
-    def __str__(self):
-        if self.status == "match":
-            return f"  OK {self.date}: {self.schwab_shares:.4f} shares @ ${self.schwab_cost_basis:.2f}"
-        elif self.status == "missing_in_quicken":
-            return f"  MISSING IN QUICKEN - {self.date}: Schwab has {self.schwab_shares:.4f} shares @ ${self.schwab_cost_basis:.2f}"
-        elif self.status == "missing_in_schwab":
-            return f"  MISSING IN SCHWAB - {self.date}: Quicken has {self.quicken_shares:.4f} shares @ ${self.quicken_cost_basis:.2f}"
-        else:  # mismatch
-            shares_diff = f" shares: {self.schwab_shares:.4f} vs {self.quicken_shares:.4f}" if abs(self.schwab_shares - self.quicken_shares) > 0.01 else ""
-            cost_diff = f" cost: ${self.schwab_cost_basis:.2f} vs ${self.quicken_cost_basis:.2f}" if abs(self.schwab_cost_basis - self.quicken_cost_basis) > 0.01 else ""
-            return f"  MISMATCH - {self.date}:{shares_diff}{cost_diff}"
+    return AccountSecurities(securities=securities, account_name=matched_account_name)
 
 
-def process_stock_lots(securities: AccountSecurities, stock_lots_file: str) -> List[LotComparison]:
-    """
-    Compare lots between Schwab CSV export and Quicken account data.
-    
-    Args:
-        securities: Dictionary of Security objects from Quicken, indexed by ticker
-        stock_lots_file: Path to Schwab CSV file (e.g., 'aapl.csv')
-    
-    Returns:
-        List of LotComparison objects showing matches and discrepancies
-    """
-    input_path = Path(stock_lots_file)
-    if not input_path.exists():
-        raise SystemExit(f"Input file not found: {input_path.resolve()}")
-    
-    # Extract ticker from filename (e.g., 'aapl.csv' -> 'AAPL')
-    ticker = input_path.stem.upper()
-    
+def quicken_lots_by_date(security: Security) -> dict[str, dict[str, float]]:
+    lots: dict[str, dict[str, float]] = {}
+    for lot in security.lots:
+        if not lot.name.startswith("Lot "):
+            continue
+        date_text = normalize_date(lot.name[4:].strip())
+        if not date_text:
+            continue
+        add_lot(lots, date_text, lot.shares, lot.cost_basis)
+    return lots
+
+
+def compare_symbol(
+    ticker: str,
+    schwab_lots: dict[str, dict[str, float]],
+    quicken_security: Optional[Security],
+    show_discrepancies: bool = False,
+) -> list[LotComparison]:
     print(f"\n=== Comparing {ticker} lots: Schwab vs Quicken ===\n")
-    
-    # Get Quicken security data
-    quicken_security = securities.get(ticker)
-    if not quicken_security:
+
+    if quicken_security is None:
         print(f"WARNING: {ticker} not found in Quicken account")
         quicken_security = Security(name=ticker, ticker=ticker)
-    
-    # Parse Schwab CSV
-    schwab_lots = {}
-    with input_path.open("r", newline="", encoding="utf-8-sig") as f:
-        # Skip first two header rows in Schwab CSV
-        next(f)  # Skip title row
-        next(f)  # Skip blank row
-        reader = csv.DictReader(f)
-        
-        for row in reader:
-            open_date = row.get("Open Date", "").strip()
-            quantity = row.get("Quantity", "").strip()
-            cost_basis = row.get("Cost Basis", "").strip()
-            
-            # Skip header rows, empty rows, or total rows
-            if not open_date or not quantity or open_date == "Open Date" or open_date == "Total":
-                continue
-            
-            shares = parse_number(quantity)
-            cost = parse_number(cost_basis)
-            
-            if abs(shares) < 1e-9:  # Skip zero-share rows
-                continue
-            
-            # Normalize date format: remove leading zeros (e.g., "02/16/2024" -> "2/16/2024")
-            parts = open_date.split("/")
-            if len(parts) == 3:
-                normalized_date = f"{int(parts[0])}/{int(parts[1])}/{parts[2]}"
-                schwab_lots[normalized_date] = {"shares": shares, "cost_basis": cost}
-    
-    # Parse Quicken lots - extract date from "Lot MM/DD/YYYY" format
-    quicken_lots = {}
-    for lot in quicken_security.lots:
-        # Extract date from lot name (e.g., "Lot 12/13/2004" -> "12/13/2004")
-        if lot.name.startswith("Lot "):
-            date_str = lot.name[4:].strip()
-            # Normalize date format: remove leading zeros for comparison (e.g., "02/16/2024" -> "2/16/2024")
-            # This handles cases where Schwab uses M/D/YYYY and Quicken uses MM/DD/YYYY
-            parts = date_str.split("/")
-            if len(parts) == 3:
-                normalized_date = f"{int(parts[0])}/{int(parts[1])}/{parts[2]}"
-                quicken_lots[normalized_date] = {"shares": lot.shares, "cost_basis": lot.cost_basis}
-    
-    # Compare lots
-    comparisons = []
-    all_dates = set(schwab_lots.keys()) | set(quicken_lots.keys())
-    
-    for date in sorted(all_dates):
-        schwab_data = schwab_lots.get(date, {})
-        quicken_data = quicken_lots.get(date, {})
-        
+
+    quicken_lots = quicken_lots_by_date(quicken_security)
+    comparisons: list[LotComparison] = []
+
+    for date_text in sorted(set(schwab_lots) | set(quicken_lots), key=sortable_date):
+        schwab_data = schwab_lots.get(date_text, {})
+        quicken_data = quicken_lots.get(date_text, {})
+
         schwab_shares = schwab_data.get("shares", 0.0)
         schwab_cost = schwab_data.get("cost_basis", 0.0)
         quicken_shares = quicken_data.get("shares", 0.0)
         quicken_cost = quicken_data.get("cost_basis", 0.0)
-        
-        # Determine status
-        if date in schwab_lots and date not in quicken_lots:
+
+        if date_text in schwab_lots and date_text not in quicken_lots:
             status = "missing_in_quicken"
-        elif date not in schwab_lots and date in quicken_lots:
+        elif date_text not in schwab_lots and date_text in quicken_lots:
             status = "missing_in_schwab"
         elif abs(schwab_shares - quicken_shares) > 0.01 or abs(schwab_cost - quicken_cost) > 0.01:
             status = "mismatch"
         else:
             status = "match"
-        
-        comparison = LotComparison(
-            date=date,
-            schwab_shares=schwab_shares,
-            quicken_shares=quicken_shares,
-            schwab_cost_basis=schwab_cost,
-            quicken_cost_basis=quicken_cost,
-            status=status
+
+        comparisons.append(
+            LotComparison(
+                date=date_text,
+                schwab_shares=schwab_shares,
+                quicken_shares=quicken_shares,
+                schwab_cost_basis=schwab_cost,
+                quicken_cost_basis=quicken_cost,
+                status=status,
+            )
         )
-        comparisons.append(comparison)
-    
-    # Print summary
-    matches = sum(1 for c in comparisons if c.status == "match")
-    mismatches = sum(1 for c in comparisons if c.status == "mismatch")
-    missing_quicken = sum(1 for c in comparisons if c.status == "missing_in_quicken")
-    missing_schwab = sum(1 for c in comparisons if c.status == "missing_in_schwab")
-    
+
+    matches = sum(1 for comparison in comparisons if comparison.status == "match")
+    mismatches = sum(1 for comparison in comparisons if comparison.status == "mismatch")
+    missing_quicken = sum(1 for comparison in comparisons if comparison.status == "missing_in_quicken")
+    missing_schwab = sum(1 for comparison in comparisons if comparison.status == "missing_in_schwab")
+
     print(f"Total lots compared: {len(comparisons)}")
     print(f"  Matches: {matches}")
     print(f"  Mismatches: {mismatches}")
     print(f"  Missing in Quicken: {missing_quicken}")
     print(f"  Missing in Schwab: {missing_schwab}")
     print()
-    
-    # Print details for non-matching lots
-    if mismatches + missing_quicken + missing_schwab > 0:
+
+    discrepancy_count = mismatches + missing_quicken + missing_schwab
+    if discrepancy_count > 0 and show_discrepancies:
         print("Discrepancies:")
-        for comp in comparisons:
-            if comp.status != "match":
-                print(comp)
+        for comparison in comparisons:
+            if comparison.status != "match":
+                print(comparison)
+    elif discrepancy_count > 0:
+        print(f"Discrepancies hidden ({discrepancy_count}); use --show-discrepancies to display lot details.")
     else:
         print("All lots match!")
-    
-    # Print totals comparison
+
     schwab_total_shares = sum(lot["shares"] for lot in schwab_lots.values())
     schwab_total_cost = sum(lot["cost_basis"] for lot in schwab_lots.values())
     quicken_total_shares = quicken_security.shares
     quicken_total_cost = quicken_security.cost_basis
-    
-    print(f"\nTotals:")
+
+    print("\nTotals:")
     print(f"  Schwab:  {schwab_total_shares:.4f} shares, ${schwab_total_cost:.2f} cost basis")
     print(f"  Quicken: {quicken_total_shares:.4f} shares, ${quicken_total_cost:.2f} cost basis")
-    
+
     if abs(schwab_total_shares - quicken_total_shares) > 0.01:
         print(f"  WARNING: Share difference: {schwab_total_shares - quicken_total_shares:.4f}")
     if abs(schwab_total_cost - quicken_total_cost) > 0.01:
         print(f"  WARNING: Cost basis difference: ${schwab_total_cost - quicken_total_cost:.2f}")
-    
+
     return comparisons
 
 
-def stock_lots(securities: AccountSecurities, stock_lots_file: str):
-    input_path = Path(stock_lots_file)
-    if not input_path.exists():
-        raise SystemExit(f"Input file not found: {input_path.resolve()}")
-
-    with input_path.open("r", newline="", encoding="utf-8-sig") as f_in:
-        reader = csv.DictReader(f_in)
-
-        # Check that required columns exist
-        missing = [
-            col_name for col_name in CONFIG.values()
-            if col_name is not None and col_name not in reader.fieldnames
-        ]
-        if missing:
-            raise SystemExit(
-                "These configured columns were not found in the CSV header:\n"
-                + "\n".join(f"  - {m}" for m in missing)
-                + "\n\nEdit CONFIG at the top of the script to match the actual column names."
-            )
-
-        # Prepare output
-        with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f_out:
-            fieldnames = [
-                "#",
-                "Security",
-                "Symbol",
-                "Schwab Account",
-                "Acquisition Date",
-                "Shares",
-                "Cost Basis ($)",
-                "Transaction Type (Buy / Reinvest / Transfer)",
-                "Quicken Action (Add Shares / Edit Buy)",
-                "Memo / Notes",
-            ]
-            writer = csv.DictWriter(f_out, fieldnames=fieldnames)
-            writer.writeheader()
-
-            # We'll also accumulate totals per (account, security, symbol)
-            totals = {}
-
-            row_num = 0
-            for row in reader:
-                security = row.get(CONFIG["security_col"], "").strip()
-                symbol = row.get(CONFIG["symbol_col"], "").strip()
-                account = (
-                    row.get(CONFIG["account_col"], "").strip()
-                    if CONFIG["account_col"] is not None
-                    else ""
-                )
-                acquired_date = row.get(CONFIG["acquired_date_col"], "").strip()
-                shares_str = row.get(CONFIG["shares_col"], "").strip()
-                cost_str = row.get(CONFIG["cost_basis_col"], "").strip()
-
-                # Skip blank or summary rows
-                if not security or not shares_str:
-                    continue
-
-                shares = parse_number(shares_str)
-                cost_basis = parse_number(cost_str)
-
-                # Skip rows with zero shares (often headers/totals)
-                if abs(shares) < 1e-9:
-                    continue
-
-                row_num += 1
-
-                # Guess transaction type from description; user can edit
-                if "reinvest" in security.lower():
-                    txn_type = "Reinvest"
-                    memo = "Dividend reinvestment (from Schwab CSV)"
-                else:
-                    txn_type = "Buy"
-                    memo = "Rebuild basis from Schwab CSV"
-
-                writer.writerow({
-                    "#": row_num,
-                    "Security": security,
-                    "Symbol": symbol,
-                    "Schwab Account": account,
-                    "Acquisition Date": acquired_date,
-                    "Shares": f"{shares:.6f}",
-                    "Cost Basis ($)": f"{cost_basis:.2f}",
-                    "Transaction Type (Buy / Reinvest / Transfer)": txn_type,
-                    "Quicken Action (Add Shares / Edit Buy)": "Add Shares",
-                    "Memo / Notes": memo,
-                })
-
-                key = (account, security, symbol)
-                if key not in totals:
-                    totals[key] = {"shares": 0.0, "cost": 0.0}
-                totals[key]["shares"] += shares
-                totals[key]["cost"] += cost_basis
-
-            # Add blank line then totals summary
-            writer.writerow({})
-            writer.writerow({
-                "#": "",
-                "Security": "=== TOTALS PER SECURITY (for Remove Shares & verification) ===",
-            })
-
-            for (account, security, symbol), agg in sorted(totals.items()):
-                row_num += 1
-                writer.writerow({
-                    "#": row_num,
-                    "Security": security,
-                    "Symbol": symbol,
-                    "Schwab Account": account,
-                    "Acquisition Date": "",
-                    "Shares": f"{agg['shares']:.6f}",
-                    "Cost Basis ($)": f"{agg['cost']:.2f}",
-                    "Transaction Type (Buy / Reinvest / Transfer)": "TOTAL",
-                    "Quicken Action (Add Shares / Edit Buy)": "Use for Remove Shares total",
-                    "Memo / Notes": "Use this as total shares when entering Remove Shares in Quicken",
-                })
-
-    print(f"Done. Wrote template to: {Path(OUTPUT_CSV).resolve()}")
-
-
-if __name__ == "__main__":
-    quicken_lots = 'Quicken_Lots.xlsx'
-    lots_dir = 'lots'
-    
-    # Get list of stock CSV files to process
-    if len(sys.argv) > 1:
-        # Use command-line arguments
-        stock_files = sys.argv[1:]
-    else:
-        # Auto-discover CSV files in lots subdirectory
-        lots_path = Path(lots_dir)
-        if not lots_path.exists():
-            print(f"ERROR: Lots directory not found: {lots_path.resolve()}")
-            print(f"Please create a '{lots_dir}' subdirectory and place Schwab CSV files there.")
-            print("Usage: python basis.py [ticker1.csv ticker2.csv ...]")
-            sys.exit(1)
-        
-        stock_files = glob.glob(f'{lots_dir}/*.csv')
-        if not stock_files:
-            print(f"No CSV files found in {lots_dir}/ directory.")
-            print(f"Please place Schwab lot CSV files in the '{lots_dir}' subdirectory.")
-            print("Usage: python basis.py [ticker1.csv ticker2.csv ...]")
-            sys.exit(1)
-    
-    # Parse Quicken lots file
-    quicken_lots_file = Path(quicken_lots)
-    if not quicken_lots_file.exists():
-        print(f"ERROR: Quicken lots file not found: {quicken_lots_file.resolve()}")
-        print(f"Please export from Quicken: Investments → Portfolio → Expand lots → Export CSV")
-        sys.exit(1)
-    
-    print(f"\n=== Parsing {quicken_lots_file} ===")
-    securities = parse_quicken_lots(str(quicken_lots_file), stock_files)
+def print_quicken_summary(securities: dict[str, Security]) -> None:
     print(f"Found {len(securities)} securities in Quicken\n")
-    
-    for ticker, data in securities.items():
-        print(f"{ticker}: {data.name}")
-        print(f"  Total Shares: {data.shares:.2f}")
-        print(f"  Total Cost Basis: ${data.cost_basis:.2f}")
-        print(f"  Market Value: ${data.market_value:.2f}")
-        print(f"  Number of Lots: {len(data.lots)}")
-        
-        # Show first few lots as example
-        for i, lot in enumerate(data.lots[:3]):
+
+    for ticker, security in sorted(securities.items()):
+        print(f"{ticker}: {security.name}")
+        print(f"  Total Shares: {security.shares:.2f}")
+        print(f"  Total Cost Basis: ${security.cost_basis:.2f}")
+        print(f"  Market Value: ${security.market_value:.2f}")
+        print(f"  Number of Lots: {len(security.lots)}")
+
+        for lot in security.lots[:3]:
             print(f"    {lot.name}: {lot.shares:.2f} shares @ ${lot.cost_basis:.2f}")
-        if len(data.lots) > 3:
-            print(f"    ... and {len(data.lots) - 3} more lots")
+        if len(security.lots) > 3:
+            print(f"    ... and {len(security.lots) - 3} more lots")
         print()
-    
-    # Process each stock CSV file
-    print(f"\n=== Processing {len(stock_files)} stock file(s) ===")
-    for stock_file in stock_files:
-        stock_path = Path(stock_file)
-        if not stock_path.exists():
-            print(f"WARNING: File not found, skipping: {stock_file}")
-            continue
-        
-        try:
-            process_stock_lots(securities, stock_file)
-            print("\n" + "="*60 + "\n")
-        except Exception as e:
-            print(f"ERROR processing {stock_file}: {e}")
-            print("\n" + "="*60 + "\n")
-    
-    # Compare ticker symbols between Quicken and CSV files
-    print("\n" + "="*60)
+
+
+def print_ticker_comparison(quicken_tickers: set[str], schwab_tickers: set[str]) -> None:
+    print("\n" + "=" * 60)
     print("TICKER SYMBOL COMPARISON")
-    print("="*60)
-    
-    # Get tickers from Quicken
-    quicken_tickers = set(securities.keys())
-    
-    # Get tickers from CSV filenames (stem without path)
-    csv_tickers = set()
-    for stock_file in stock_files:
-        ticker = Path(stock_file).stem.upper()
-        csv_tickers.add(ticker)
-    
-    # Calculate differences
-    only_in_quicken = quicken_tickers - csv_tickers
-    only_in_csv = csv_tickers - quicken_tickers
-    in_both = quicken_tickers & csv_tickers
-    
+    print("=" * 60)
+
+    only_in_quicken = quicken_tickers - schwab_tickers
+    only_in_schwab = schwab_tickers - quicken_tickers
+    in_both = quicken_tickers & schwab_tickers
+
     print(f"\nTickers in Quicken: {len(quicken_tickers)}")
-    print(f"Tickers in CSV files: {len(csv_tickers)}")
+    print(f"Tickers in Schwab CSV: {len(schwab_tickers)}")
     print(f"Tickers in both: {len(in_both)}")
-    
+
     if only_in_quicken:
         print(f"\nTickers ONLY in Quicken ({len(only_in_quicken)}):")
         for ticker in sorted(only_in_quicken):
-            security = securities[ticker]
-            print(f"  {ticker}: {security.name}")
-    
-    if only_in_csv:
-        print(f"\nTickers ONLY in CSV files ({len(only_in_csv)}):")
-        for ticker in sorted(only_in_csv):
             print(f"  {ticker}")
-    
-    if not only_in_quicken and not only_in_csv:
-        print("\n✓ All tickers match perfectly!")
-    
-    print("\n" + "="*60)
-     
+
+    if only_in_schwab:
+        print(f"\nTickers ONLY in Schwab CSV ({len(only_in_schwab)}):")
+        for ticker in sorted(only_in_schwab):
+            print(f"  {ticker}")
+
+    if not only_in_quicken and not only_in_schwab:
+        print("\nAll tickers match perfectly!")
+
+    print("\n" + "=" * 60)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Compare Schwab lot data to the latest matching Quicken lots workbook."
+    )
+    parser.add_argument(
+        "--show-discrepancies",
+        action="store_true",
+        help="display individual lot discrepancy details",
+    )
+    args = parser.parse_args()
+
+    schwab_file = find_schwab_lot_file()
+    quicken_file = find_latest_quicken_lots_file()
+
+    print(f"\n=== Parsing Schwab lots: {schwab_file} ===")
+    schwab = load_schwab_lots(schwab_file)
+    print(f"Found {len(schwab.lots_by_symbol)} symbols in Schwab lots")
+
+    print(f"\n=== Parsing Quicken lots: {quicken_file} ===")
+    quicken = parse_quicken_lots(quicken_file, schwab.account_suffix)
+    print(f"Using Quicken account: {quicken.account_name}")
+    print_quicken_summary(quicken.securities)
+
+    print(f"\n=== Processing {len(schwab.lots_by_symbol)} Schwab symbol(s) ===")
+    for ticker in sorted(set(schwab.lots_by_symbol) | set(quicken.securities)):
+        compare_symbol(
+            ticker,
+            schwab.lots_by_symbol.get(ticker, {}),
+            quicken.securities.get(ticker),
+            show_discrepancies=args.show_discrepancies,
+        )
+        print("\n" + "=" * 60 + "\n")
+
+    print_ticker_comparison(set(quicken.securities), set(schwab.lots_by_symbol))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
