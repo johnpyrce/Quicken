@@ -4,7 +4,8 @@ schwab_quicken_rebuild.py
 
 Does ALL the upgrades:
 
-1) Reads ONE Schwab "Lot Details" CSV per security from ./lots/   (no parameter)
+1) Reads Schwab lot details from one combined CSV in ./SchwabLots/.
+   The combined file has Symbol as the first column on each lot row.
 2) Groups lots into 4 buckets:
       VERY_OLD  : acq < 2020-01-01
       OLD       : 2020-01-01 <= acq < 2023-01-01
@@ -24,7 +25,7 @@ Does ALL the upgrades:
    - If not found, it still writes the other files and notes validation was skipped.
 
 How to run:
-  Put your Schwab per-security lot CSVs in ./lots/*.csv
+  Put your combined Schwab lot CSV in ./SchwabLots/
   (Optional) Put Schwab positions export in ./schwab_positions.csv
   Run: python schwab_quicken_rebuild.py
 """
@@ -45,7 +46,7 @@ from typing import Dict, List, Tuple, Optional, Set
 # Fixed locations / default outputs (per your request)
 # -------------------------
 
-LOTS_DIR = Path("lots")  # required name; no parameter
+SCHWAB_LOTS_DIR = Path("SchwabLots")  # required name; no parameter
 POSITIONS_SUMMARY_FILE = Path("Quicken_Lots.xlsx")  # optional; auto-used if present
 
 OUT_CHECKLIST = Path("quicken_addshares_checklist.csv")
@@ -61,6 +62,7 @@ MEMO_TEXT = "Schwab rebuild – grouped lots"
 DATE_COL = "Open Date"
 SHARES_COL = "Quantity"
 COST_COL = "Cost Basis"
+SYMBOL_COL = "Symbol"
 
 
 # -------------------------
@@ -125,6 +127,7 @@ def parse_decimal_any(s) -> Decimal:
         neg = True
         s = s[1:-1].strip()
 
+    s = re.sub(r"\s+\d+$", "", s)
     s = s.replace("$", "").replace(",", "").replace("*", "").strip()
     try:
         v = Decimal(s)
@@ -153,19 +156,6 @@ class Lot:
 # -------------------------
 # Schwab lot CSV parsing (your per-security format)
 # -------------------------
-
-def extract_symbol_from_title(title_line: str) -> str:
-    """
-    Example: "AAPL Lot Details for ... as of 12:18 PM ET, 12/23/2025"
-    """
-    title_line = (title_line or "").strip()
-    m = re.match(r"^\s*([A-Z0-9.\-]+)\s+Lot Details\b", title_line)
-    if m:
-        return m.group(1).upper()
-    # fallback: first token
-    tok = title_line.split(" ", 1)[0] if title_line else ""
-    return tok.upper() if tok else "UNKNOWN"
-
 
 def extract_as_of_date_from_title(title_line: str) -> Optional[date]:
     """
@@ -212,50 +202,61 @@ def find_header_row(rows: List[List[str]]) -> int:
     raise ValueError(f"Could not find header row containing '{DATE_COL}', '{SHARES_COL}', and '{COST_COL}'.")
 
 
-def load_lots_file(path: Path) -> Tuple[List[Lot], date]:
+def load_combined_lots_file(path: Path) -> Tuple[List[Lot], date, Optional[Decimal]]:
     """
-    Returns (lots, as_of_date_used)
+    Returns (lots, as_of_date_used, cash_cost) from a combined Schwab lot file.
+
+    Expected shape:
+      Schwab Lot Details for ...993 as of 08:05:57 PM ET, 06/23/2026
+
+      Symbol,Open Date,Quantity,...,Cost Basis,...
+      AAPL,02/16/2024,0.123,...,$12.34,...
+      CASH,,0,...,$3,440.17,...
     """
-    # Read entire CSV with csv.reader to handle the title row + header row
     text = path.read_text(encoding="utf-8-sig")
     rows = list(csv.reader(text.splitlines()))
     if not rows:
-        return ([], date.today())
+        return ([], date.today(), None)
 
     title_line = rows[0][0] if rows[0] else ""
-    symbol = extract_symbol_from_title(title_line)
     as_of = extract_as_of_date_from_title(title_line) or date.today()
 
     hdr_idx = find_header_row(rows)
     header = rows[hdr_idx]
     idx = {h.strip(): i for i, h in enumerate(header)}
 
-    for needed in (DATE_COL, SHARES_COL, COST_COL):
+    for needed in (SYMBOL_COL, DATE_COL, SHARES_COL, COST_COL):
         if needed not in idx:
             raise ValueError(f"{path.name}: Missing expected column {needed!r}. Found: {header}")
 
     lots: List[Lot] = []
+    cash_cost: Optional[Decimal] = None
+
     for r in rows[hdr_idx + 1 :]:
         if not r or all((c or "").strip() == "" for c in r):
+            continue
+
+        symbol = (r[idx[SYMBOL_COL]].strip().upper() if idx[SYMBOL_COL] < len(r) else "")
+        if not symbol:
+            continue
+
+        cost_raw = r[idx[COST_COL]] if idx[COST_COL] < len(r) else ""
+        if symbol == "CASH":
+            cash_cost = parse_decimal_any(cost_raw)
             continue
 
         d_raw = r[idx[DATE_COL]].strip() if idx[DATE_COL] < len(r) else ""
         if not d_raw:
             continue
-        
-        # Skip summary/total rows
         if d_raw.lower() in ("total", "totals", "grand total", "summary"):
             continue
 
         try:
             acq = parse_date_any(d_raw)
         except ValueError:
-            # Skip rows with invalid dates (likely summary rows)
             continue
-            
-        shares_raw = r[idx[SHARES_COL]] if idx[SHARES_COL] < len(r) else ""
-        cost_raw = r[idx[COST_COL]] if idx[COST_COL] < len(r) else ""
 
+        shares_raw = r[idx[SHARES_COL]] if idx[SHARES_COL] < len(r) else ""
         shares = parse_decimal_any(shares_raw)
         cost = parse_decimal_any(cost_raw)
 
@@ -264,24 +265,7 @@ def load_lots_file(path: Path) -> Tuple[List[Lot], date]:
 
         lots.append(Lot(symbol=symbol, acq_date=acq, shares=shares, cost=cost))
 
-    return (lots, as_of)
-
-
-def load_cash_file(path: Path) -> Decimal:
-    text = path.read_text(encoding="utf-8-sig")
-    rows = list(csv.reader(text.splitlines()))
-    if len(rows) < 4:
-        return Decimal("0")
-
-    header = rows[2]
-    idx = {h.strip(): i for i, h in enumerate(header)}
-    cost_idx = idx.get("Cost Basis")
-    if cost_idx is None:
-        return Decimal("0")
-
-    value_row = rows[3]
-    cost_raw = value_row[cost_idx] if cost_idx < len(value_row) else "0"
-    return parse_decimal_any(cost_raw)
+    return (lots, as_of, cash_cost)
 
 
 # -------------------------
@@ -320,7 +304,7 @@ class AggRow:
     lots_count: int
 
 
-def aggregate_all(files: List[Path]) -> Tuple[List[AggRow], Dict[str, Dict[str, Decimal]], Dict[str, Dict[str, int]]]:
+def aggregate_all(schwab_lot_file: Path) -> Tuple[List[AggRow], Dict[str, Dict[str, Decimal]], Dict[str, Dict[str, int]]]:
     """
     Returns:
       - list of aggregated bucket rows (for checklist)
@@ -333,44 +317,38 @@ def aggregate_all(files: List[Path]) -> Tuple[List[AggRow], Dict[str, Dict[str, 
     per_symbol_totals: Dict[str, Dict[str, Decimal]] = {}
     per_symbol_counts: Dict[str, Dict[str, int]] = {}
 
-    for f in files:
-        if f.stem.lower() == "cash":
-            cash_cost = load_cash_file(f)
-            sym = "CASH"
-            per_symbol_counts.setdefault(sym, {"lot_files": 0, "lots": 0, "bucket_rows": 0})
-            per_symbol_counts[sym]["lot_files"] += 1
-            per_symbol_counts[sym]["lots"] += 1
-            per_symbol_totals[sym] = {"shares": Decimal("0"), "cost": cash_cost}
-            continue
-
-        lots, as_of = load_lots_file(f)
-        if not lots:
-            continue
-
-        sym = lots[0].symbol if lots else "UNKNOWN"
+    lots, as_of, cash_cost = load_combined_lots_file(schwab_lot_file)
+    if cash_cost is not None:
+        sym = "CASH"
         per_symbol_counts.setdefault(sym, {"lot_files": 0, "lots": 0, "bucket_rows": 0})
         per_symbol_counts[sym]["lot_files"] += 1
+        per_symbol_counts[sym]["lots"] += 1
+        per_symbol_totals[sym] = {"shares": Decimal("0"), "cost": cash_cost}
 
-        per_symbol_totals.setdefault(sym, {"shares": Decimal("0"), "cost": Decimal("0")})
+    seen_symbols = set()
+    for lot in lots:
+        if lot.symbol not in seen_symbols:
+            per_symbol_counts.setdefault(lot.symbol, {"lot_files": 0, "lots": 0, "bucket_rows": 0})
+            per_symbol_counts[lot.symbol]["lot_files"] += 1
+            per_symbol_totals.setdefault(lot.symbol, {"shares": Decimal("0"), "cost": Decimal("0")})
+            seen_symbols.add(lot.symbol)
 
-        for lot in lots:
-            b = bucket_name_for(lot.acq_date, as_of)
-            key = (lot.symbol, b)
-            agg.setdefault(key, {"shares": Decimal("0"), "cost": Decimal("0")})
-            counts[key] = counts.get(key, 0) + 1
+        b = bucket_name_for(lot.acq_date, as_of)
+        key = (lot.symbol, b)
+        agg.setdefault(key, {"shares": Decimal("0"), "cost": Decimal("0")})
+        counts[key] = counts.get(key, 0) + 1
 
-            agg[key]["shares"] += lot.shares
-            agg[key]["cost"] += lot.cost
+        agg[key]["shares"] += lot.shares
+        agg[key]["cost"] += lot.cost
 
-            # Remember the quicken date per (symbol,bucket). For SHORT_TERM, we want the *latest* as_of date encountered.
-            qd = quicken_bucket_date(b, as_of)
-            prev = quick_dates.get(key)
-            if prev is None or (b == "SHORT_TERM" and qd > prev):
-                quick_dates[key] = qd
+        qd = quicken_bucket_date(b, as_of)
+        prev = quick_dates.get(key)
+        if prev is None or (b == "SHORT_TERM" and qd > prev):
+            quick_dates[key] = qd
 
-            per_symbol_totals[lot.symbol]["shares"] += lot.shares
-            per_symbol_totals[lot.symbol]["cost"] += lot.cost
-            per_symbol_counts[lot.symbol]["lots"] += 1
+        per_symbol_totals[lot.symbol]["shares"] += lot.shares
+        per_symbol_totals[lot.symbol]["cost"] += lot.cost
+        per_symbol_counts[lot.symbol]["lots"] += 1
 
     # Build AggRow list
     out_rows: List[AggRow] = []
@@ -425,6 +403,22 @@ def detect_account_suffix_from_lot_files(paths: List[Path]) -> Optional[str]:
     return next(iter(suffixes))
 
 
+def find_schwab_lot_file() -> Path:
+    if not SCHWAB_LOTS_DIR.exists() or not SCHWAB_LOTS_DIR.is_dir():
+        raise SystemExit("Expected a subdirectory named 'SchwabLots' in the current folder.")
+
+    lot_files = sorted(SCHWAB_LOTS_DIR.glob("*.csv"))
+    if not lot_files:
+        raise SystemExit("No CSV files found in ./SchwabLots/")
+    if len(lot_files) > 1:
+        names = ", ".join(path.name for path in lot_files)
+        raise SystemExit(
+            "Expected exactly one Schwab lot CSV in ./SchwabLots/. "
+            f"Found {len(lot_files)}: {names}"
+        )
+    return lot_files[0]
+
+
 def build_output_paths(account_name: Optional[str]) -> Tuple[Path, Path, Path]:
     if not account_name:
         return OUT_CHECKLIST, OUT_SUBTOTALS, OUT_VALIDATION
@@ -445,7 +439,7 @@ def load_positions_summary(path: Path) -> Tuple[Dict[str, Dict[str, Decimal]], O
     """
     out: Dict[str, Dict[str, Decimal]] = {}
 
-    account_suffix = detect_account_suffix_from_lot_files(sorted(LOTS_DIR.glob("*.csv")))
+    account_suffix = detect_account_suffix_from_lot_files([find_schwab_lot_file()])
     if not account_suffix:
         raise ValueError("Could not determine account suffix from lot file titles.")
 
@@ -609,15 +603,10 @@ def write_subtotals(
 # -------------------------
 
 def main() -> None:
-    if not LOTS_DIR.exists() or not LOTS_DIR.is_dir():
-        raise SystemExit("Expected a subdirectory named 'lots' in the current folder.")
+    schwab_lot_file = find_schwab_lot_file()
 
-    lot_files = sorted(LOTS_DIR.glob("*.csv"))
-    if not lot_files:
-        raise SystemExit("No CSV files found in ./lots/")
-
-    agg_rows, per_symbol_totals, per_symbol_counts = aggregate_all(lot_files)
-    account_suffix = detect_account_suffix_from_lot_files(lot_files)
+    agg_rows, per_symbol_totals, per_symbol_counts = aggregate_all(schwab_lot_file)
+    account_suffix = detect_account_suffix_from_lot_files([schwab_lot_file])
     account_name = f"account_{account_suffix}" if account_suffix else None
 
     if POSITIONS_SUMMARY_FILE.exists():
@@ -643,7 +632,7 @@ def main() -> None:
             f.write("Validation skipped: file Quicken_Lots.xlsx not found in current folder.\n")
         validation_msg = "Validation skipped (no Quicken_Lots.xlsx); stub report written."
 
-    print(f"Read lot files: {len(lot_files)} from ./{LOTS_DIR}/")
+    print(f"Read lot source: {schwab_lot_file}")
     print(f"Wrote checklist: {checklist_path} ({len(agg_rows)} Add-Shares lines)")
     print(f"Wrote subtotals: {subtotals_path} ({len(per_symbol_totals)} securities)")
     print(validation_msg)

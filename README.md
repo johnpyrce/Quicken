@@ -9,8 +9,8 @@ Use the local `.venv` before running any Python scripts in this repo.
 
 - `.venv/` - local Python virtual environment (recommended runtime)
 - `Exports/` - Quicken exported files (for example Quicken `.QIF` output)
-- `lots-Inheritance/` - Schwab lot CSV exports for the Inheritance account
-- `scrape_schwab_lots.py` - downloads Schwab lot CSVs via Chrome CDP session
+- `SchwabLots/` - combined Schwab lot CSV exports, one file per Schwab account
+- `scrape_schwab_lots.py` - extracts Schwab lot CSVs from a logged-in Safari tab, with Chrome CDP as an optional fallback
 - `schwab_quicken_rebuild.py` - main lot bucketing + checklist generation script
 - `lot_basis_comparison.py` - lot-by-lot comparison against Quicken export workbook
 - `schwab_lots_to_quicken_checklist.py` - older single-file conversion utility
@@ -26,31 +26,34 @@ These scripts are run on the PC hosted Quicken to extract lots and a QIF version
 
 ## Primary Workflow
 
-### 1) Start Chrome and log in to Schwab
+### 1) Open Safari and log in to Schwab
 
-Use `SchwabInChrome.sh` (or equivalent) so Chrome is running with remote debugging on port `9222`, then log in manually.
+In Safari, enable `Develop > Allow JavaScript from Apple Events`, then log in to Schwab manually.
 
-### 2) Download Schwab lot CSVs
+If you prefer the older Chrome workflow, use `SchwabInChrome.sh` (or equivalent)
+so Chrome is running with remote debugging on port `9222`, then pass
+`--browser chrome-cdp` when running the scraper.
+
+### 2) Extract Schwab lot CSVs
 
 ```bash
 python scrape_schwab_lots.py
 # or
 python scrape_schwab_lots.py "Inheritance"
 python scrape_schwab_lots.py "Joint Account"
+# Chrome fallback:
+python scrape_schwab_lots.py --browser chrome-cdp
 ```
 
-Output is written to `lots-<account>/` (for example `lots-Inheritance/`).
+Output is written to `SchwabLots/<Schwab account name>.csv`.
+The script opens each holding's Schwab Lot Details overlay and writes the table
+to one combined CSV locally, with `Symbol` as the first column on each lot row,
+so it does not depend on Schwab's browser download event.
 
 ### 3) Prepare working lot folder for rebuild
 
-`schwab_quicken_rebuild.py` expects input files in `./lots/*.csv`.
-
-If you just downloaded `lots-Inheritance/`, copy or rename it:
-
-```bash
-cp -R lots-Inheritance lots
-# or: mv lots-Inheritance lots
-```
+`schwab_quicken_rebuild.py` expects exactly one combined Schwab lot CSV in
+`./SchwabLots/`.
 
 ### 4) Build Quicken checklist output
 
@@ -73,8 +76,6 @@ Validation behavior:
 
 ```bash
 python lot_basis_comparison.py
-# or specific symbols/files:
-python lot_basis_comparison.py lots/AAPL.csv lots/MSFT.csv
 ```
 
 `lot_basis_comparison.py` compares Schwab lots to the matching account section in `Quicken_Lots.xlsx`.
