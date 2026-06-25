@@ -9,6 +9,7 @@ orig_lots/
 # Data files
 *.csv
 *.xlsx
+*.html
 
 # exports
 Exports/
