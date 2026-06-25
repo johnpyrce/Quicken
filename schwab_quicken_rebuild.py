@@ -19,14 +19,14 @@ Does ALL the upgrades:
    - schwab_quicken_validation_report.csv (diff vs Schwab positions summary, if found)
 
 4) Validation (optional but automatic):
-   - If a Schwab "Positions/Summary" CSV exists in the current folder, named:
-        schwab_positions.csv
-     …it will compare per-symbol Shares + Cost Basis totals and write a report.
-   - If not found, it still writes the other files and notes validation was skipped.
+   - If QuickenExports/QuickenLots_YYYY-MM-DD.xlsx exists, the newest dated
+     workbook is used to compare per-symbol Shares + Cost Basis totals.
+   - If no matching workbook is found, it still writes the other files and
+     notes validation was skipped.
 
 How to run:
   Put your combined Schwab lot CSV in ./SchwabLots/
-  (Optional) Put Schwab positions export in ./schwab_positions.csv
+  (Optional) Put Quicken lot exports in ./QuickenExports/QuickenLots_YYYY-MM-DD.xlsx
   Run: python schwab_quicken_rebuild.py
 """
 
@@ -47,7 +47,8 @@ from typing import Dict, List, Tuple, Optional, Set
 # -------------------------
 
 SCHWAB_LOTS_DIR = Path("SchwabLots")  # required name; no parameter
-POSITIONS_SUMMARY_FILE = Path("Quicken_Lots.xlsx")  # optional; auto-used if present
+QUICKEN_EXPORTS_DIR = Path("QuickenExports")
+QUICKEN_LOTS_PATTERN = re.compile(r"^QuickenLots_(\d{4}-\d{2}-\d{2})\.xlsx$")
 
 OUT_CHECKLIST = Path("quicken_addshares_checklist.csv")
 OUT_SUBTOTALS = Path("quicken_security_subtotals.csv")
@@ -419,6 +420,27 @@ def find_schwab_lot_file() -> Path:
     return lot_files[0]
 
 
+def find_latest_quicken_lots_file() -> Optional[Path]:
+    if not QUICKEN_EXPORTS_DIR.exists() or not QUICKEN_EXPORTS_DIR.is_dir():
+        return None
+
+    candidates: List[Tuple[date, Path]] = []
+    for path in QUICKEN_EXPORTS_DIR.glob("QuickenLots_*.xlsx"):
+        match = QUICKEN_LOTS_PATTERN.match(path.name)
+        if not match:
+            continue
+        try:
+            export_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        candidates.append((export_date, path))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
 def build_output_paths(account_name: Optional[str]) -> Tuple[Path, Path, Path]:
     if not account_name:
         return OUT_CHECKLIST, OUT_SUBTOTALS, OUT_VALIDATION
@@ -433,7 +455,7 @@ def build_output_paths(account_name: Optional[str]) -> Tuple[Path, Path, Path]:
 
 def load_positions_summary(path: Path) -> Tuple[Dict[str, Dict[str, Decimal]], Optional[str]]:
     """
-    Returns per-symbol totals from the Quicken_Lots workbook for the account
+    Returns per-symbol totals from the Quicken lot export workbook for the account
     matching the lot file account suffix:
       { "AAPL": {"shares":..., "cost":...}, ... }
     """
@@ -604,13 +626,14 @@ def write_subtotals(
 
 def main() -> None:
     schwab_lot_file = find_schwab_lot_file()
+    quicken_lots_file = find_latest_quicken_lots_file()
 
     agg_rows, per_symbol_totals, per_symbol_counts = aggregate_all(schwab_lot_file)
     account_suffix = detect_account_suffix_from_lot_files([schwab_lot_file])
     account_name = f"account_{account_suffix}" if account_suffix else None
 
-    if POSITIONS_SUMMARY_FILE.exists():
-        _, workbook_account_name = load_positions_summary(POSITIONS_SUMMARY_FILE)
+    if quicken_lots_file:
+        _, workbook_account_name = load_positions_summary(quicken_lots_file)
         if workbook_account_name:
             account_name = workbook_account_name
 
@@ -620,17 +643,17 @@ def main() -> None:
     write_subtotals(per_symbol_totals, per_symbol_counts, subtotals_path)
 
     # Optional validation
-    if POSITIONS_SUMMARY_FILE.exists():
-        schwab_pos, workbook_account_name = load_positions_summary(POSITIONS_SUMMARY_FILE)
+    if quicken_lots_file:
+        schwab_pos, workbook_account_name = load_positions_summary(quicken_lots_file)
         if workbook_account_name:
             checklist_path, subtotals_path, validation_path = build_output_paths(workbook_account_name)
         write_validation_report(schwab_pos, per_symbol_totals, validation_path)
-        validation_msg = f"Validation written: {validation_path}"
+        validation_msg = f"Validation written: {validation_path} using {quicken_lots_file}"
     else:
         # Still emit an empty-ish report that says skipped (handy reminder)
         with validation_path.open("w", newline="", encoding="utf-8") as f:
-            f.write("Validation skipped: file Quicken_Lots.xlsx not found in current folder.\n")
-        validation_msg = "Validation skipped (no Quicken_Lots.xlsx); stub report written."
+            f.write("Validation skipped: no QuickenExports/QuickenLots_YYYY-MM-DD.xlsx file found.\n")
+        validation_msg = "Validation skipped (no QuickenExports/QuickenLots_YYYY-MM-DD.xlsx); stub report written."
 
     print(f"Read lot source: {schwab_lot_file}")
     print(f"Wrote checklist: {checklist_path} ({len(agg_rows)} Add-Shares lines)")

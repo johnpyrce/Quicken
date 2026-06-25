@@ -69,8 +69,8 @@ Expected outputs:
 
 Validation behavior:
 
-- If `Quicken_Lots.xlsx` exists in the repo root, validation runs automatically.
-- If `Quicken_Lots.xlsx` is missing, checklist/subtotals still generate and validation is skipped.
+- If one or more `QuickenExports/QuickenLots_YYYY-MM-DD.xlsx` files exist, the newest dated file is used for validation.
+- If no matching export exists, checklist/subtotals still generate and validation is skipped.
 
 ### 5) Optional: lot-level audit
 
@@ -78,12 +78,12 @@ Validation behavior:
 python lot_basis_comparison.py
 ```
 
-`lot_basis_comparison.py` compares Schwab lots to the matching account section in `Quicken_Lots.xlsx`.
+`lot_basis_comparison.py` compares Schwab lots to the matching account section in the Quicken lot export workbook.
 
 ## Data Expectations
 
 - Schwab lot files are report-style CSVs where the first line contains title metadata, including `as of` date and masked account suffix.
-- `Quicken_Lots.xlsx` should be a Portfolio export with lot rows expanded.
+- `QuickenExports/QuickenLots_YYYY-MM-DD.xlsx` should be a Portfolio export with lot rows expanded.
 - Numeric fields may include `$`, commas, `*`, or trailing minus notation; scripts normalize these formats.
 
 ## Notes

@@ -1,6 +1,8 @@
 import argparse
 import csv
+import html
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +16,9 @@ SYMBOL_COL = "Symbol"
 OPEN_DATE_COL = "Open Date"
 QUANTITY_COL = "Quantity"
 COST_BASIS_COL = "Cost Basis"
+MARKET_VALUE_COL = "Market Value"
+CASH_SYMBOL = "CASH"
+CASH_LOT_KEY = "__cash__"
 
 
 @dataclass
@@ -89,6 +94,20 @@ class LotComparison:
             else ""
         )
         return f"  MISMATCH - {self.date}:{shares_diff}{cost_diff}"
+
+
+@dataclass
+class SymbolComparison:
+    symbol: str
+    name: str
+    schwab_shares: float
+    schwab_cost_basis: float
+    quicken_shares: float
+    quicken_cost_basis: float
+    schwab_lots: int
+    quicken_lots: int
+    market_value: float
+    lot_comparisons: list[LotComparison] = field(default_factory=list)
 
 
 def parse_number(value) -> float:
@@ -203,7 +222,7 @@ def find_header_row(rows: list[list[str]]) -> tuple[int, list[str]]:
         if SYMBOL_COL in normalized and OPEN_DATE_COL in normalized:
             missing = [
                 column
-                for column in (SYMBOL_COL, OPEN_DATE_COL, QUANTITY_COL, COST_BASIS_COL)
+                for column in (SYMBOL_COL, OPEN_DATE_COL, QUANTITY_COL, COST_BASIS_COL, MARKET_VALUE_COL)
                 if column not in normalized
             ]
             if missing:
@@ -219,11 +238,18 @@ def find_header_row(rows: list[list[str]]) -> tuple[int, list[str]]:
     )
 
 
-def add_lot(lots: dict[str, dict[str, float]], date_text: str, shares: float, cost: float) -> None:
+def add_lot(
+    lots: dict[str, dict[str, float]],
+    date_text: str,
+    shares: float,
+    cost: float,
+    market_value: float = 0.0,
+) -> None:
     if date_text not in lots:
-        lots[date_text] = {"shares": 0.0, "cost_basis": 0.0}
+        lots[date_text] = {"shares": 0.0, "cost_basis": 0.0, "market_value": 0.0}
     lots[date_text]["shares"] += shares
     lots[date_text]["cost_basis"] += cost
+    lots[date_text]["market_value"] += market_value
 
 
 def load_schwab_lots(path: Path) -> SchwabLots:
@@ -245,7 +271,12 @@ def load_schwab_lots(path: Path) -> SchwabLots:
         open_date = values.get(OPEN_DATE_COL, "").strip()
         quantity = values.get(QUANTITY_COL, "").strip()
 
-        if not symbol or symbol == "CASH":
+        if not symbol:
+            continue
+        if symbol == CASH_SYMBOL:
+            cost = parse_number(values.get(COST_BASIS_COL, ""))
+            market_value = parse_number(values.get(MARKET_VALUE_COL, "")) or cost
+            add_lot(lots_by_symbol.setdefault(CASH_SYMBOL, {}), CASH_LOT_KEY, 0.0, cost, market_value)
             continue
         if not open_date or open_date.lower() == "total" or not quantity:
             continue
@@ -256,10 +287,11 @@ def load_schwab_lots(path: Path) -> SchwabLots:
 
         shares = parse_number(quantity)
         cost = parse_number(values.get(COST_BASIS_COL, ""))
+        market_value = parse_number(values.get(MARKET_VALUE_COL, ""))
         if abs(shares) < 1e-9:
             continue
 
-        add_lot(lots_by_symbol.setdefault(symbol, {}), date_text, shares, cost)
+        add_lot(lots_by_symbol.setdefault(symbol, {}), date_text, shares, cost, market_value)
 
     if not lots_by_symbol:
         raise SystemExit(f"ERROR: No stock lots found in combined Schwab file: {path.resolve()}")
@@ -297,6 +329,18 @@ def parse_quicken_lots(path: Path, account_suffix: Optional[str]) -> AccountSecu
             shares = parse_number(cells[4])
             market_value = parse_number(cells[5])
             cost_basis = parse_number(cells[6])
+
+            # Quicken reports cash as a row named "Cash" without a ticker symbol.
+            if current_account_matches and name.lower() == "cash":
+                securities[CASH_SYMBOL] = Security(
+                    name="Cash",
+                    ticker=CASH_SYMBOL,
+                    shares=0.0,
+                    market_value=market_value or cost_basis,
+                    cost_basis=cost_basis,
+                )
+                current_security = None
+                continue
 
             # Account summary/header row, e.g. "Estate 3993".
             if name and not ticker and cells[4] is None:
@@ -361,130 +405,267 @@ def compare_symbol(
     ticker: str,
     schwab_lots: dict[str, dict[str, float]],
     quicken_security: Optional[Security],
-    show_discrepancies: bool = False,
-) -> list[LotComparison]:
-    print(f"\n=== Comparing {ticker} lots: Schwab vs Quicken ===\n")
-
+) -> SymbolComparison:
     if quicken_security is None:
-        print(f"WARNING: {ticker} not found in Quicken account")
         quicken_security = Security(name=ticker, ticker=ticker)
 
-    quicken_lots = quicken_lots_by_date(quicken_security)
     comparisons: list[LotComparison] = []
 
-    for date_text in sorted(set(schwab_lots) | set(quicken_lots), key=sortable_date):
-        schwab_data = schwab_lots.get(date_text, {})
-        quicken_data = quicken_lots.get(date_text, {})
-
-        schwab_shares = schwab_data.get("shares", 0.0)
-        schwab_cost = schwab_data.get("cost_basis", 0.0)
-        quicken_shares = quicken_data.get("shares", 0.0)
-        quicken_cost = quicken_data.get("cost_basis", 0.0)
-
-        if date_text in schwab_lots and date_text not in quicken_lots:
-            status = "missing_in_quicken"
-        elif date_text not in schwab_lots and date_text in quicken_lots:
-            status = "missing_in_schwab"
-        elif abs(schwab_shares - quicken_shares) > 0.01 or abs(schwab_cost - quicken_cost) > 0.01:
-            status = "mismatch"
-        else:
-            status = "match"
-
-        comparisons.append(
-            LotComparison(
-                date=date_text,
-                schwab_shares=schwab_shares,
-                quicken_shares=quicken_shares,
-                schwab_cost_basis=schwab_cost,
-                quicken_cost_basis=quicken_cost,
-                status=status,
-            )
-        )
-
-    matches = sum(1 for comparison in comparisons if comparison.status == "match")
-    mismatches = sum(1 for comparison in comparisons if comparison.status == "mismatch")
-    missing_quicken = sum(1 for comparison in comparisons if comparison.status == "missing_in_quicken")
-    missing_schwab = sum(1 for comparison in comparisons if comparison.status == "missing_in_schwab")
-
-    print(f"Total lots compared: {len(comparisons)}")
-    print(f"  Matches: {matches}")
-    print(f"  Mismatches: {mismatches}")
-    print(f"  Missing in Quicken: {missing_quicken}")
-    print(f"  Missing in Schwab: {missing_schwab}")
-    print()
-
-    discrepancy_count = mismatches + missing_quicken + missing_schwab
-    if discrepancy_count > 0 and show_discrepancies:
-        print("Discrepancies:")
-        for comparison in comparisons:
-            if comparison.status != "match":
-                print(comparison)
-    elif discrepancy_count > 0:
-        print(f"Discrepancies hidden ({discrepancy_count}); use --show-discrepancies to display lot details.")
+    if ticker == CASH_SYMBOL:
+        quicken_lots = {}
     else:
-        print("All lots match!")
+        quicken_lots = quicken_lots_by_date(quicken_security)
+
+        for date_text in sorted(set(schwab_lots) | set(quicken_lots), key=sortable_date):
+            schwab_data = schwab_lots.get(date_text, {})
+            quicken_data = quicken_lots.get(date_text, {})
+
+            schwab_shares = schwab_data.get("shares", 0.0)
+            schwab_cost = schwab_data.get("cost_basis", 0.0)
+            quicken_shares = quicken_data.get("shares", 0.0)
+            quicken_cost = quicken_data.get("cost_basis", 0.0)
+
+            if date_text in schwab_lots and date_text not in quicken_lots:
+                status = "missing_in_quicken"
+            elif date_text not in schwab_lots and date_text in quicken_lots:
+                status = "missing_in_schwab"
+            elif abs(schwab_shares - quicken_shares) > 0.01 or abs(schwab_cost - quicken_cost) > 0.01:
+                status = "mismatch"
+            else:
+                status = "match"
+
+            comparisons.append(
+                LotComparison(
+                    date=date_text,
+                    schwab_shares=schwab_shares,
+                    quicken_shares=quicken_shares,
+                    schwab_cost_basis=schwab_cost,
+                    quicken_cost_basis=quicken_cost,
+                    status=status,
+                )
+            )
 
     schwab_total_shares = sum(lot["shares"] for lot in schwab_lots.values())
     schwab_total_cost = sum(lot["cost_basis"] for lot in schwab_lots.values())
-    quicken_total_shares = quicken_security.shares
-    quicken_total_cost = quicken_security.cost_basis
+    schwab_total_market_value = sum(lot["market_value"] for lot in schwab_lots.values())
+    schwab_lot_count = 0 if ticker == CASH_SYMBOL else len(schwab_lots)
+    quicken_lot_count = 0 if ticker == CASH_SYMBOL else len(quicken_lots)
 
-    print("\nTotals:")
-    print(f"  Schwab:  {schwab_total_shares:.4f} shares, ${schwab_total_cost:.2f} cost basis")
-    print(f"  Quicken: {quicken_total_shares:.4f} shares, ${quicken_total_cost:.2f} cost basis")
-
-    if abs(schwab_total_shares - quicken_total_shares) > 0.01:
-        print(f"  WARNING: Share difference: {schwab_total_shares - quicken_total_shares:.4f}")
-    if abs(schwab_total_cost - quicken_total_cost) > 0.01:
-        print(f"  WARNING: Cost basis difference: ${schwab_total_cost - quicken_total_cost:.2f}")
-
-    return comparisons
-
-
-def print_quicken_summary(securities: dict[str, Security]) -> None:
-    print(f"Found {len(securities)} securities in Quicken\n")
-
-    for ticker, security in sorted(securities.items()):
-        print(f"{ticker}: {security.name}")
-        print(f"  Total Shares: {security.shares:.2f}")
-        print(f"  Total Cost Basis: ${security.cost_basis:.2f}")
-        print(f"  Market Value: ${security.market_value:.2f}")
-        print(f"  Number of Lots: {len(security.lots)}")
-
-        for lot in security.lots[:3]:
-            print(f"    {lot.name}: {lot.shares:.2f} shares @ ${lot.cost_basis:.2f}")
-        if len(security.lots) > 3:
-            print(f"    ... and {len(security.lots) - 3} more lots")
-        print()
+    return SymbolComparison(
+        symbol=ticker,
+        name=quicken_security.name,
+        schwab_shares=schwab_total_shares,
+        schwab_cost_basis=schwab_total_cost,
+        quicken_shares=quicken_security.shares,
+        quicken_cost_basis=quicken_security.cost_basis,
+        schwab_lots=schwab_lot_count,
+        quicken_lots=quicken_lot_count,
+        market_value=schwab_total_market_value,
+        lot_comparisons=comparisons,
+    )
 
 
-def print_ticker_comparison(quicken_tickers: set[str], schwab_tickers: set[str]) -> None:
-    print("\n" + "=" * 60)
-    print("TICKER SYMBOL COMPARISON")
-    print("=" * 60)
+def format_float(value: float, precision: int = 2) -> str:
+    return f"{value:,.{precision}f}"
 
-    only_in_quicken = quicken_tickers - schwab_tickers
-    only_in_schwab = schwab_tickers - quicken_tickers
-    in_both = quicken_tickers & schwab_tickers
 
-    print(f"\nTickers in Quicken: {len(quicken_tickers)}")
-    print(f"Tickers in Schwab CSV: {len(schwab_tickers)}")
-    print(f"Tickers in both: {len(in_both)}")
+def format_currency(value: float) -> str:
+    return f"${value:,.2f}"
 
-    if only_in_quicken:
-        print(f"\nTickers ONLY in Quicken ({len(only_in_quicken)}):")
-        for ticker in sorted(only_in_quicken):
-            print(f"  {ticker}")
 
-    if only_in_schwab:
-        print(f"\nTickers ONLY in Schwab CSV ({len(only_in_schwab)}):")
-        for ticker in sorted(only_in_schwab):
-            print(f"  {ticker}")
+def comparison_flag(
+    schwab_shares: float,
+    quicken_shares: float,
+    schwab_cost_basis: float,
+    quicken_cost_basis: float,
+) -> str:
+    shares_differ = abs(schwab_shares - quicken_shares) > 0.01
+    cost_basis_differs = abs(schwab_cost_basis - quicken_cost_basis) > 0.01
+    return "*" if shares_differ or cost_basis_differs else ""
 
-    if not only_in_quicken and not only_in_schwab:
-        print("\nAll tickers match perfectly!")
 
-    print("\n" + "=" * 60)
+def symbol_table_rows(comparisons: list[SymbolComparison]) -> tuple[list[str], list[list[str]]]:
+    headers = [
+        "Symbol",
+        "Flag",
+        "Schwab Shares",
+        "Quicken Shares",
+        "Schwab Cost Basis",
+        "Quicken Cost Basis",
+        "Schwab Lots",
+        "Quicken Lots",
+        "Market Value",
+    ]
+    rows = [
+        [
+            comparison.symbol,
+            comparison_flag(
+                comparison.schwab_shares,
+                comparison.quicken_shares,
+                comparison.schwab_cost_basis,
+                comparison.quicken_cost_basis,
+            ),
+            format_float(comparison.schwab_shares, 4),
+            format_float(comparison.quicken_shares, 4),
+            format_currency(comparison.schwab_cost_basis),
+            format_currency(comparison.quicken_cost_basis),
+            str(comparison.schwab_lots),
+            str(comparison.quicken_lots),
+            format_currency(comparison.market_value),
+        ]
+        for comparison in comparisons
+    ]
+    total_schwab_shares = sum(comparison.schwab_shares for comparison in comparisons)
+    total_quicken_shares = sum(comparison.quicken_shares for comparison in comparisons)
+    total_schwab_cost_basis = sum(comparison.schwab_cost_basis for comparison in comparisons)
+    total_quicken_cost_basis = sum(comparison.quicken_cost_basis for comparison in comparisons)
+    total_schwab_lots = sum(comparison.schwab_lots for comparison in comparisons)
+    total_quicken_lots = sum(comparison.quicken_lots for comparison in comparisons)
+    rows.append(
+        [
+            "TOTAL",
+            comparison_flag(
+                total_schwab_shares,
+                total_quicken_shares,
+                total_schwab_cost_basis,
+                total_quicken_cost_basis,
+            ),
+            format_float(total_schwab_shares, 4),
+            format_float(total_quicken_shares, 4),
+            format_currency(total_schwab_cost_basis),
+            format_currency(total_quicken_cost_basis),
+            str(total_schwab_lots),
+            str(total_quicken_lots),
+            format_currency(sum(comparison.market_value for comparison in comparisons)),
+        ]
+    )
+    return headers, rows
+
+
+def print_symbol_table(comparisons: list[SymbolComparison]) -> None:
+    headers, rows = symbol_table_rows(comparisons)
+    left_aligned_columns = {0, 1}
+    widths = [
+        max(len(header), *(len(row[index]) for row in rows))
+        for index, header in enumerate(headers)
+    ]
+
+    header = "  ".join(
+        value.ljust(widths[index]) if index in left_aligned_columns else value.rjust(widths[index])
+        for index, value in enumerate(headers)
+    )
+    separator = "  ".join("-" * width for width in widths)
+
+    print(header)
+    print(separator)
+    for index, row in enumerate(rows):
+        if index == len(rows) - 1:
+            print(separator)
+        print(
+            "  ".join(
+                value.ljust(widths[index]) if index in left_aligned_columns else value.rjust(widths[index])
+                for index, value in enumerate(row)
+            )
+        )
+
+
+def print_markdown_symbol_table(comparisons: list[SymbolComparison], account_name: Optional[str]) -> None:
+    headers, rows = symbol_table_rows(comparisons)
+    print(f"# {account_name or 'Quicken Account'}")
+    print()
+    print("| " + " | ".join(headers) + " |")
+    print("| " + " | ".join("---" for _ in headers) + " |")
+    for row in rows:
+        print("| " + " | ".join(row) + " |")
+
+
+def print_csv_symbol_table(comparisons: list[SymbolComparison]) -> None:
+    headers, rows = symbol_table_rows(comparisons)
+    writer = csv.writer(sys.stdout)
+    writer.writerow(headers)
+    writer.writerows(rows)
+
+
+def print_html_symbol_table(comparisons: list[SymbolComparison], account_name: Optional[str]) -> None:
+    headers, rows = symbol_table_rows(comparisons)
+    title = account_name or "Quicken Account"
+
+    print("<!doctype html>")
+    print('<html lang="en">')
+    print("<head>")
+    print('  <meta charset="utf-8">')
+    print('  <meta name="viewport" content="width=device-width, initial-scale=1">')
+    print(f"  <title>{html.escape(title)}</title>")
+    print("  <style>")
+    print("    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 24px; }")
+    print("    table { border-collapse: collapse; width: auto; max-width: none; }")
+    print("    th, td { border: 1px solid #d0d7de; padding: 6px 10px; white-space: nowrap; }")
+    print("    th { background: #f6f8fa; text-align: right; }")
+    print("    th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }")
+    print("    td { text-align: right; }")
+    print("    tr.flagged { background: #fff8c5; }")
+    print("    tbody tr:last-child { font-weight: 700; }")
+    print("  </style>")
+    print("</head>")
+    print("<body>")
+    print(f"  <h1>{html.escape(title)}</h1>")
+    print("  <table>")
+    print("    <thead>")
+    print("      <tr>")
+    for header in headers:
+        print(f"        <th>{html.escape(header)}</th>")
+    print("      </tr>")
+    print("    </thead>")
+    print("    <tbody>")
+    for row in rows:
+        row_class = ' class="flagged"' if row[1] else ""
+        print(f"      <tr{row_class}>")
+        for value in row:
+            print(f"        <td>{html.escape(value)}</td>")
+        print("      </tr>")
+    print("    </tbody>")
+    print("  </table>")
+    print("</body>")
+    print("</html>")
+
+
+def print_symbol_report(
+    comparisons: list[SymbolComparison],
+    output_format: str,
+    account_name: Optional[str],
+) -> None:
+    if output_format == "text":
+        print_symbol_table(comparisons)
+    elif output_format == "markdown":
+        print_markdown_symbol_table(comparisons, account_name)
+    elif output_format == "csv":
+        print_csv_symbol_table(comparisons)
+    elif output_format == "html":
+        print_html_symbol_table(comparisons, account_name)
+    else:
+        raise ValueError(f"Unsupported output format: {output_format}")
+
+
+def print_lot_discrepancies(comparisons: list[SymbolComparison], output=sys.stdout) -> None:
+    printed_header = False
+    for symbol_comparison in comparisons:
+        discrepancies = [
+            comparison
+            for comparison in symbol_comparison.lot_comparisons
+            if comparison.status != "match"
+        ]
+        if not discrepancies:
+            continue
+
+        if not printed_header:
+            print("\nLot Discrepancies:", file=output)
+            printed_header = True
+        print(f"\n{symbol_comparison.symbol}:", file=output)
+        for discrepancy in discrepancies:
+            print(discrepancy, file=output)
+
+    if not printed_header:
+        print("\nNo lot discrepancies.", file=output)
 
 
 def main() -> int:
@@ -496,31 +677,41 @@ def main() -> int:
         action="store_true",
         help="display individual lot discrepancy details",
     )
+    parser.add_argument(
+        "--format",
+        choices=("text", "markdown", "csv", "html"),
+        default="text",
+        help="output table format (default: text)",
+    )
     args = parser.parse_args()
+    status_output = sys.stderr if args.format in {"csv", "markdown", "html"} else sys.stdout
 
     schwab_file = find_schwab_lot_file()
     quicken_file = find_latest_quicken_lots_file()
 
-    print(f"\n=== Parsing Schwab lots: {schwab_file} ===")
+    print(f"\n=== Parsing Schwab lots: {schwab_file} ===", file=status_output)
     schwab = load_schwab_lots(schwab_file)
-    print(f"Found {len(schwab.lots_by_symbol)} symbols in Schwab lots")
+    print(f"Found {len(schwab.lots_by_symbol)} symbols in Schwab lots", file=status_output)
 
-    print(f"\n=== Parsing Quicken lots: {quicken_file} ===")
     quicken = parse_quicken_lots(quicken_file, schwab.account_suffix)
-    print(f"Using Quicken account: {quicken.account_name}")
-    print_quicken_summary(quicken.securities)
 
-    print(f"\n=== Processing {len(schwab.lots_by_symbol)} Schwab symbol(s) ===")
+    comparisons: list[SymbolComparison] = []
     for ticker in sorted(set(schwab.lots_by_symbol) | set(quicken.securities)):
-        compare_symbol(
-            ticker,
-            schwab.lots_by_symbol.get(ticker, {}),
-            quicken.securities.get(ticker),
-            show_discrepancies=args.show_discrepancies,
+        comparisons.append(
+            compare_symbol(
+                ticker,
+                schwab.lots_by_symbol.get(ticker, {}),
+                quicken.securities.get(ticker),
+            )
         )
-        print("\n" + "=" * 60 + "\n")
 
-    print_ticker_comparison(set(quicken.securities), set(schwab.lots_by_symbol))
+    if args.format not in {"markdown", "html"}:
+        print(f"\nUsing Quicken account: {quicken.account_name}", file=status_output)
+    print_symbol_report(comparisons, args.format, quicken.account_name)
+
+    if args.show_discrepancies:
+        print_lot_discrepancies(comparisons, output=status_output)
+
     return 0
 
 
