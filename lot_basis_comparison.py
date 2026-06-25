@@ -19,6 +19,17 @@ COST_BASIS_COL = "Cost Basis"
 MARKET_VALUE_COL = "Market Value"
 CASH_SYMBOL = "CASH"
 CASH_LOT_KEY = "__cash__"
+SYMBOL_TABLE_HEADERS = [
+    ("Symbol", ""),
+    ("Flag", ""),
+    ("Schwab", "Shares"),
+    ("Quicken", "Shares"),
+    ("Schwab", "Cost Basis"),
+    ("Quicken", "Cost Basis"),
+    ("Schwab", "Lots"),
+    ("Quicken", "Lots"),
+    ("Market", "Value"),
+]
 
 
 @dataclass
@@ -473,6 +484,22 @@ def format_currency(value: float) -> str:
     return f"${value:,.2f}"
 
 
+def matching_value_marker(left_value: float, right_value: float, precision: int) -> str:
+    left = format_float(left_value, precision)
+    right = format_float(right_value, precision)
+    return "=" if left == right else right
+
+
+def matching_currency_marker(left_value: float, right_value: float) -> str:
+    left = format_currency(left_value)
+    right = format_currency(right_value)
+    return "=" if left == right else right
+
+
+def matching_integer_marker(left_value: int, right_value: int) -> str:
+    return "=" if left_value == right_value else str(right_value)
+
+
 def comparison_flag(
     schwab_shares: float,
     quicken_shares: float,
@@ -484,18 +511,7 @@ def comparison_flag(
     return "*" if shares_differ or cost_basis_differs else ""
 
 
-def symbol_table_rows(comparisons: list[SymbolComparison]) -> tuple[list[str], list[list[str]]]:
-    headers = [
-        "Symbol",
-        "Flag",
-        "Schwab Shares",
-        "Quicken Shares",
-        "Schwab Cost Basis",
-        "Quicken Cost Basis",
-        "Schwab Lots",
-        "Quicken Lots",
-        "Market Value",
-    ]
+def symbol_table_rows(comparisons: list[SymbolComparison]) -> list[list[str]]:
     rows = [
         [
             comparison.symbol,
@@ -506,11 +522,11 @@ def symbol_table_rows(comparisons: list[SymbolComparison]) -> tuple[list[str], l
                 comparison.quicken_cost_basis,
             ),
             format_float(comparison.schwab_shares, 4),
-            format_float(comparison.quicken_shares, 4),
+            matching_value_marker(comparison.schwab_shares, comparison.quicken_shares, 4),
             format_currency(comparison.schwab_cost_basis),
-            format_currency(comparison.quicken_cost_basis),
+            matching_currency_marker(comparison.schwab_cost_basis, comparison.quicken_cost_basis),
             str(comparison.schwab_lots),
-            str(comparison.quicken_lots),
+            matching_integer_marker(comparison.schwab_lots, comparison.quicken_lots),
             format_currency(comparison.market_value),
         ]
         for comparison in comparisons
@@ -531,32 +547,36 @@ def symbol_table_rows(comparisons: list[SymbolComparison]) -> tuple[list[str], l
                 total_quicken_cost_basis,
             ),
             format_float(total_schwab_shares, 4),
-            format_float(total_quicken_shares, 4),
+            matching_value_marker(total_schwab_shares, total_quicken_shares, 4),
             format_currency(total_schwab_cost_basis),
-            format_currency(total_quicken_cost_basis),
+            matching_currency_marker(total_schwab_cost_basis, total_quicken_cost_basis),
             str(total_schwab_lots),
-            str(total_quicken_lots),
+            matching_integer_marker(total_schwab_lots, total_quicken_lots),
             format_currency(sum(comparison.market_value for comparison in comparisons)),
         ]
     )
-    return headers, rows
+    return rows
 
 
 def print_symbol_table(comparisons: list[SymbolComparison]) -> None:
-    headers, rows = symbol_table_rows(comparisons)
+    rows = symbol_table_rows(comparisons)
     left_aligned_columns = {0, 1}
     widths = [
-        max(len(header), *(len(row[index]) for row in rows))
-        for index, header in enumerate(headers)
+        max(*(len(line) for line in header), *(len(row[index]) for row in rows))
+        for index, header in enumerate(SYMBOL_TABLE_HEADERS)
     ]
 
-    header = "  ".join(
-        value.ljust(widths[index]) if index in left_aligned_columns else value.rjust(widths[index])
-        for index, value in enumerate(headers)
-    )
+    header_lines = [
+        "  ".join(
+            value.ljust(widths[index]) if index in left_aligned_columns else value.rjust(widths[index])
+            for index, value in enumerate(line_values)
+        )
+        for line_values in zip(*SYMBOL_TABLE_HEADERS)
+    ]
     separator = "  ".join("-" * width for width in widths)
 
-    print(header)
+    for header_line in header_lines:
+        print(header_line)
     print(separator)
     for index, row in enumerate(rows):
         if index == len(rows) - 1:
@@ -569,8 +589,21 @@ def print_symbol_table(comparisons: list[SymbolComparison]) -> None:
         )
 
 
+def markdown_header(header: tuple[str, str]) -> str:
+    return "<br>".join(line for line in header if line)
+
+
+def csv_header(header: tuple[str, str]) -> str:
+    return "\n".join(line for line in header if line)
+
+
+def html_header(header: tuple[str, str]) -> str:
+    return "<br>".join(html.escape(line) for line in header if line)
+
+
 def print_markdown_symbol_table(comparisons: list[SymbolComparison], account_name: Optional[str]) -> None:
-    headers, rows = symbol_table_rows(comparisons)
+    rows = symbol_table_rows(comparisons)
+    headers = [markdown_header(header) for header in SYMBOL_TABLE_HEADERS]
     print(f"# {account_name or 'Quicken Account'}")
     print()
     print("| " + " | ".join(headers) + " |")
@@ -580,14 +613,14 @@ def print_markdown_symbol_table(comparisons: list[SymbolComparison], account_nam
 
 
 def print_csv_symbol_table(comparisons: list[SymbolComparison]) -> None:
-    headers, rows = symbol_table_rows(comparisons)
+    rows = symbol_table_rows(comparisons)
     writer = csv.writer(sys.stdout)
-    writer.writerow(headers)
+    writer.writerow([csv_header(header) for header in SYMBOL_TABLE_HEADERS])
     writer.writerows(rows)
 
 
 def print_html_symbol_table(comparisons: list[SymbolComparison], account_name: Optional[str]) -> None:
-    headers, rows = symbol_table_rows(comparisons)
+    rows = symbol_table_rows(comparisons)
     title = account_name or "Quicken Account"
 
     print("<!doctype html>")
@@ -600,7 +633,7 @@ def print_html_symbol_table(comparisons: list[SymbolComparison], account_name: O
     print("    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 24px; }")
     print("    table { border-collapse: collapse; width: auto; max-width: none; }")
     print("    th, td { border: 1px solid #d0d7de; padding: 6px 10px; white-space: nowrap; }")
-    print("    th { background: #f6f8fa; text-align: right; }")
+    print("    th { background: #f6f8fa; text-align: right; vertical-align: bottom; }")
     print("    th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }")
     print("    td { text-align: right; }")
     print("    tr.flagged { background: #fff8c5; }")
@@ -612,8 +645,8 @@ def print_html_symbol_table(comparisons: list[SymbolComparison], account_name: O
     print("  <table>")
     print("    <thead>")
     print("      <tr>")
-    for header in headers:
-        print(f"        <th>{html.escape(header)}</th>")
+    for header in SYMBOL_TABLE_HEADERS:
+        print(f"        <th>{html_header(header)}</th>")
     print("      </tr>")
     print("    </thead>")
     print("    <tbody>")
@@ -706,7 +739,7 @@ def main() -> int:
         )
 
     if args.format not in {"markdown", "html"}:
-        print(f"\nUsing Quicken account: {quicken.account_name}", file=status_output)
+        print(f"\n{quicken.account_name}", file=status_output)
     print_symbol_report(comparisons, args.format, quicken.account_name)
 
     if args.show_discrepancies:
