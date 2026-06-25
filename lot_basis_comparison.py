@@ -30,6 +30,15 @@ SYMBOL_TABLE_HEADERS = [
     ("Quicken", "Lots"),
     ("Market", "Value"),
 ]
+RECENT_MATCHING_LOTS_HEADER = ("Recent", "Matching Lots")
+TRANSACTION_TABLE_HEADERS = [
+    "Symbol",
+    "Action",
+    "Share Change",
+    "Cost Basis Change",
+    "Target Shares",
+    "Target Cost Basis",
+]
 
 
 @dataclass
@@ -117,6 +126,7 @@ class SymbolComparison:
     quicken_cost_basis: float
     schwab_lots: int
     quicken_lots: int
+    recent_matching_lots: int
     market_value: float
     lot_comparisons: list[LotComparison] = field(default_factory=list)
 
@@ -461,6 +471,7 @@ def compare_symbol(
     schwab_total_market_value = sum(lot["market_value"] for lot in schwab_lots.values())
     schwab_lot_count = 0 if ticker == CASH_SYMBOL else len(schwab_lots)
     quicken_lot_count = 0 if ticker == CASH_SYMBOL else len(quicken_lots)
+    recent_matching_lots = count_recent_matching_lots(comparisons)
 
     return SymbolComparison(
         symbol=ticker,
@@ -471,9 +482,19 @@ def compare_symbol(
         quicken_cost_basis=quicken_security.cost_basis,
         schwab_lots=schwab_lot_count,
         quicken_lots=quicken_lot_count,
+        recent_matching_lots=recent_matching_lots,
         market_value=schwab_total_market_value,
         lot_comparisons=comparisons,
     )
+
+
+def count_recent_matching_lots(comparisons: list[LotComparison]) -> int:
+    count = 0
+    for comparison in sorted(comparisons, key=lambda item: sortable_date(item.date), reverse=True):
+        if comparison.status != "match":
+            break
+        count += 1
+    return count
 
 
 def format_float(value: float, precision: int = 2) -> str:
@@ -481,6 +502,8 @@ def format_float(value: float, precision: int = 2) -> str:
 
 
 def format_currency(value: float) -> str:
+    if value < 0:
+        return f"-${abs(value):,.2f}"
     return f"${value:,.2f}"
 
 
@@ -511,7 +534,17 @@ def comparison_flag(
     return "*" if shares_differ or cost_basis_differs else ""
 
 
-def symbol_table_rows(comparisons: list[SymbolComparison]) -> list[list[str]]:
+def symbol_table_headers(show_recent_matches: bool = False) -> list[tuple[str, str]]:
+    headers = list(SYMBOL_TABLE_HEADERS)
+    if show_recent_matches:
+        headers.insert(-1, RECENT_MATCHING_LOTS_HEADER)
+    return headers
+
+
+def symbol_table_rows(
+    comparisons: list[SymbolComparison],
+    show_recent_matches: bool = False,
+) -> list[list[str]]:
     rows = [
         [
             comparison.symbol,
@@ -531,39 +564,81 @@ def symbol_table_rows(comparisons: list[SymbolComparison]) -> list[list[str]]:
         ]
         for comparison in comparisons
     ]
+    if show_recent_matches:
+        for row, comparison in zip(rows, comparisons):
+            row.insert(-1, str(comparison.recent_matching_lots))
+
     total_schwab_shares = sum(comparison.schwab_shares for comparison in comparisons)
     total_quicken_shares = sum(comparison.quicken_shares for comparison in comparisons)
     total_schwab_cost_basis = sum(comparison.schwab_cost_basis for comparison in comparisons)
     total_quicken_cost_basis = sum(comparison.quicken_cost_basis for comparison in comparisons)
     total_schwab_lots = sum(comparison.schwab_lots for comparison in comparisons)
     total_quicken_lots = sum(comparison.quicken_lots for comparison in comparisons)
-    rows.append(
-        [
-            "TOTAL",
-            comparison_flag(
-                total_schwab_shares,
-                total_quicken_shares,
-                total_schwab_cost_basis,
-                total_quicken_cost_basis,
-            ),
-            format_float(total_schwab_shares, 4),
-            matching_value_marker(total_schwab_shares, total_quicken_shares, 4),
-            format_currency(total_schwab_cost_basis),
-            matching_currency_marker(total_schwab_cost_basis, total_quicken_cost_basis),
-            str(total_schwab_lots),
-            matching_integer_marker(total_schwab_lots, total_quicken_lots),
-            format_currency(sum(comparison.market_value for comparison in comparisons)),
-        ]
-    )
+    total_row = [
+        "TOTAL",
+        comparison_flag(
+            total_schwab_shares,
+            total_quicken_shares,
+            total_schwab_cost_basis,
+            total_quicken_cost_basis,
+        ),
+        format_float(total_schwab_shares, 4),
+        matching_value_marker(total_schwab_shares, total_quicken_shares, 4),
+        format_currency(total_schwab_cost_basis),
+        matching_currency_marker(total_schwab_cost_basis, total_quicken_cost_basis),
+        str(total_schwab_lots),
+        matching_integer_marker(total_schwab_lots, total_quicken_lots),
+        format_currency(sum(comparison.market_value for comparison in comparisons)),
+    ]
+    if show_recent_matches:
+        total_row.insert(-1, str(sum(comparison.recent_matching_lots for comparison in comparisons)))
+    rows.append(total_row)
     return rows
 
 
-def print_symbol_table(comparisons: list[SymbolComparison]) -> None:
-    rows = symbol_table_rows(comparisons)
+def symbols_with_share_or_cost_mismatches(comparisons: list[SymbolComparison]) -> set[str]:
+    return {
+        comparison.symbol
+        for comparison in comparisons
+        if comparison_flag(
+            comparison.schwab_shares,
+            comparison.quicken_shares,
+            comparison.schwab_cost_basis,
+            comparison.quicken_cost_basis,
+        )
+    }
+
+
+def transaction_table_rows(comparisons: list[SymbolComparison]) -> list[list[str]]:
+    mismatched_symbols = symbols_with_share_or_cost_mismatches(comparisons)
+    rows: list[list[str]] = []
+    for symbol_comparison in comparisons:
+        if symbol_comparison.symbol not in mismatched_symbols:
+            continue
+
+        share_change = symbol_comparison.schwab_shares - symbol_comparison.quicken_shares
+        cost_change = symbol_comparison.schwab_cost_basis - symbol_comparison.quicken_cost_basis
+        action = "Adjust cash" if symbol_comparison.symbol == CASH_SYMBOL else "Adjust holding"
+        rows.append(
+            [
+                symbol_comparison.symbol,
+                action,
+                format_float(share_change, 4),
+                format_currency(cost_change),
+                format_float(symbol_comparison.schwab_shares, 4),
+                format_currency(symbol_comparison.schwab_cost_basis),
+            ]
+        )
+    return rows
+
+
+def print_symbol_table(comparisons: list[SymbolComparison], show_recent_matches: bool = False) -> None:
+    rows = symbol_table_rows(comparisons, show_recent_matches=show_recent_matches)
+    headers = symbol_table_headers(show_recent_matches=show_recent_matches)
     left_aligned_columns = {0, 1}
     widths = [
         max(*(len(line) for line in header), *(len(row[index]) for row in rows))
-        for index, header in enumerate(SYMBOL_TABLE_HEADERS)
+        for index, header in enumerate(headers)
     ]
 
     header_lines = [
@@ -571,7 +646,7 @@ def print_symbol_table(comparisons: list[SymbolComparison]) -> None:
             value.ljust(widths[index]) if index in left_aligned_columns else value.rjust(widths[index])
             for index, value in enumerate(line_values)
         )
-        for line_values in zip(*SYMBOL_TABLE_HEADERS)
+        for line_values in zip(*headers)
     ]
     separator = "  ".join("-" * width for width in widths)
 
@@ -581,6 +656,34 @@ def print_symbol_table(comparisons: list[SymbolComparison]) -> None:
     for index, row in enumerate(rows):
         if index == len(rows) - 1:
             print(separator)
+        print(
+            "  ".join(
+                value.ljust(widths[index]) if index in left_aligned_columns else value.rjust(widths[index])
+                for index, value in enumerate(row)
+            )
+        )
+
+
+def print_transaction_table(comparisons: list[SymbolComparison]) -> None:
+    rows = transaction_table_rows(comparisons)
+    print("\nTransactions Needed:")
+    if not rows:
+        print("No transactions needed for symbols with share or cost-basis differences.")
+        return
+
+    left_aligned_columns = {0, 1}
+    widths = [
+        max(len(header), *(len(row[index]) for row in rows))
+        for index, header in enumerate(TRANSACTION_TABLE_HEADERS)
+    ]
+    print(
+        "  ".join(
+            header.ljust(widths[index]) if index in left_aligned_columns else header.rjust(widths[index])
+            for index, header in enumerate(TRANSACTION_TABLE_HEADERS)
+        )
+    )
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
         print(
             "  ".join(
                 value.ljust(widths[index]) if index in left_aligned_columns else value.rjust(widths[index])
@@ -601,9 +704,13 @@ def html_header(header: tuple[str, str]) -> str:
     return "<br>".join(html.escape(line) for line in header if line)
 
 
-def print_markdown_symbol_table(comparisons: list[SymbolComparison], account_name: Optional[str]) -> None:
-    rows = symbol_table_rows(comparisons)
-    headers = [markdown_header(header) for header in SYMBOL_TABLE_HEADERS]
+def print_markdown_symbol_table(
+    comparisons: list[SymbolComparison],
+    account_name: Optional[str],
+    show_recent_matches: bool = False,
+) -> None:
+    rows = symbol_table_rows(comparisons, show_recent_matches=show_recent_matches)
+    headers = [markdown_header(header) for header in symbol_table_headers(show_recent_matches)]
     print(f"# {account_name or 'Quicken Account'}")
     print()
     print("| " + " | ".join(headers) + " |")
@@ -612,15 +719,45 @@ def print_markdown_symbol_table(comparisons: list[SymbolComparison], account_nam
         print("| " + " | ".join(row) + " |")
 
 
-def print_csv_symbol_table(comparisons: list[SymbolComparison]) -> None:
-    rows = symbol_table_rows(comparisons)
+def print_markdown_transaction_table(comparisons: list[SymbolComparison]) -> None:
+    rows = transaction_table_rows(comparisons)
+    print()
+    print("## Transactions Needed")
+    print()
+    if not rows:
+        print("No transactions needed for symbols with share or cost-basis differences.")
+        return
+
+    print("| " + " | ".join(TRANSACTION_TABLE_HEADERS) + " |")
+    print("| " + " | ".join("---" for _ in TRANSACTION_TABLE_HEADERS) + " |")
+    for row in rows:
+        print("| " + " | ".join(row) + " |")
+
+
+def print_csv_symbol_table(comparisons: list[SymbolComparison], show_recent_matches: bool = False) -> None:
+    rows = symbol_table_rows(comparisons, show_recent_matches=show_recent_matches)
     writer = csv.writer(sys.stdout)
-    writer.writerow([csv_header(header) for header in SYMBOL_TABLE_HEADERS])
+    writer.writerow([csv_header(header) for header in symbol_table_headers(show_recent_matches)])
     writer.writerows(rows)
 
 
-def print_html_symbol_table(comparisons: list[SymbolComparison], account_name: Optional[str]) -> None:
-    rows = symbol_table_rows(comparisons)
+def print_csv_transaction_table(comparisons: list[SymbolComparison]) -> None:
+    rows = transaction_table_rows(comparisons)
+    writer = csv.writer(sys.stdout)
+    writer.writerow([])
+    writer.writerow(["Transactions Needed"])
+    writer.writerow(TRANSACTION_TABLE_HEADERS)
+    writer.writerows(rows)
+
+
+def print_html_symbol_table(
+    comparisons: list[SymbolComparison],
+    account_name: Optional[str],
+    show_transactions: bool = False,
+    show_recent_matches: bool = False,
+) -> None:
+    rows = symbol_table_rows(comparisons, show_recent_matches=show_recent_matches)
+    transaction_rows = transaction_table_rows(comparisons) if show_transactions else []
     title = account_name or "Quicken Account"
 
     print("<!doctype html>")
@@ -638,6 +775,7 @@ def print_html_symbol_table(comparisons: list[SymbolComparison], account_name: O
     print("    td { text-align: right; }")
     print("    tr.flagged { background: #fff8c5; }")
     print("    tbody tr:last-child { font-weight: 700; }")
+    print("    h2 { margin-top: 32px; }")
     print("  </style>")
     print("</head>")
     print("<body>")
@@ -645,7 +783,7 @@ def print_html_symbol_table(comparisons: list[SymbolComparison], account_name: O
     print("  <table>")
     print("    <thead>")
     print("      <tr>")
-    for header in SYMBOL_TABLE_HEADERS:
+    for header in symbol_table_headers(show_recent_matches):
         print(f"        <th>{html_header(header)}</th>")
     print("      </tr>")
     print("    </thead>")
@@ -658,6 +796,26 @@ def print_html_symbol_table(comparisons: list[SymbolComparison], account_name: O
         print("      </tr>")
     print("    </tbody>")
     print("  </table>")
+    if show_transactions:
+        print("  <h2>Transactions Needed</h2>")
+        if transaction_rows:
+            print("  <table>")
+            print("    <thead>")
+            print("      <tr>")
+            for header in TRANSACTION_TABLE_HEADERS:
+                print(f"        <th>{html.escape(header)}</th>")
+            print("      </tr>")
+            print("    </thead>")
+            print("    <tbody>")
+            for row in transaction_rows:
+                print("      <tr>")
+                for value in row:
+                    print(f"        <td>{html.escape(value)}</td>")
+                print("      </tr>")
+            print("    </tbody>")
+            print("  </table>")
+        else:
+            print("  <p>No transactions needed for symbols with share or cost-basis differences.</p>")
     print("</body>")
     print("</html>")
 
@@ -666,15 +824,28 @@ def print_symbol_report(
     comparisons: list[SymbolComparison],
     output_format: str,
     account_name: Optional[str],
+    show_transactions: bool = False,
+    show_recent_matches: bool = False,
 ) -> None:
     if output_format == "text":
-        print_symbol_table(comparisons)
+        print_symbol_table(comparisons, show_recent_matches=show_recent_matches)
+        if show_transactions:
+            print_transaction_table(comparisons)
     elif output_format == "markdown":
-        print_markdown_symbol_table(comparisons, account_name)
+        print_markdown_symbol_table(comparisons, account_name, show_recent_matches=show_recent_matches)
+        if show_transactions:
+            print_markdown_transaction_table(comparisons)
     elif output_format == "csv":
-        print_csv_symbol_table(comparisons)
+        print_csv_symbol_table(comparisons, show_recent_matches=show_recent_matches)
+        if show_transactions:
+            print_csv_transaction_table(comparisons)
     elif output_format == "html":
-        print_html_symbol_table(comparisons, account_name)
+        print_html_symbol_table(
+            comparisons,
+            account_name,
+            show_transactions=show_transactions,
+            show_recent_matches=show_recent_matches,
+        )
     else:
         raise ValueError(f"Unsupported output format: {output_format}")
 
@@ -711,6 +882,17 @@ def main() -> int:
         help="display individual lot discrepancy details",
     )
     parser.add_argument(
+        "-t",
+        "--transactions",
+        action="store_true",
+        help="append a table of transactions needed to update Quicken to Schwab",
+    )
+    parser.add_argument(
+        "--show-recent-matches",
+        action="store_true",
+        help="include the Recent Matching Lots column in the main table",
+    )
+    parser.add_argument(
         "--format",
         choices=("text", "markdown", "csv", "html"),
         default="text",
@@ -740,7 +922,13 @@ def main() -> int:
 
     if args.format not in {"markdown", "html"}:
         print(f"\n{quicken.account_name}", file=status_output)
-    print_symbol_report(comparisons, args.format, quicken.account_name)
+    print_symbol_report(
+        comparisons,
+        args.format,
+        quicken.account_name,
+        show_transactions=args.transactions,
+        show_recent_matches=args.show_recent_matches,
+    )
 
     if args.show_discrepancies:
         print_lot_discrepancies(comparisons, output=status_output)
