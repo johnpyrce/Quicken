@@ -1,64 +1,94 @@
 # Quicken Cost Basis Repair Tools
 
-This repository contains scripts used to repair and validate Quicken investment cost basis data using Schwab lot exports as the source of truth.
+This repository contains local tools for comparing Quicken investment cost basis
+data against Schwab lot exports. Schwab is the source
+of truth, so Quicken lots are compared and adjustments needed to make share and cost
+basis totals match are derived.
 
-Use the local `.venv` before running any Python scripts in this repo.
-
-
-## Current Repository Layout
-
-- `.venv/` - local Python virtual environment (recommended runtime)
-- `Exports/` - Quicken exported files (for example Quicken `.QIF` output)
-- `SchwabLots/` - combined Schwab lot CSV exports, one file per Schwab account
-- `scrape_schwab_lots.py` - extracts Schwab lot CSVs from a logged-in Safari tab, with Chrome CDP as an optional fallback
-- `schwab_quicken_rebuild.py` - main lot bucketing + checklist generation script
-- `lot_basis_comparison.py` - lot-by-lot comparison against Quicken export workbook
-- `schwab_lots_to_quicken_checklist.py` - older single-file conversion utility
-- `SchwabInChrome.sh` - helper for starting Chrome in Schwab workflow
-- `RepairQuickenTransactions.md` - manual Quicken repair procedure
-
-
-These scripts are run on the PC hosted Quicken to extract lots and a QIF version of the data:
-
-- collector.ps1:  PowerShell version for Power Automation.
-- flow.txt:  the Power Automatiion flow.
-- collector.py:  pywinauto version.
-
-## Primary Workflow
-
-### 1) Open Safari and log in to Schwab
-
-In Safari, enable `Develop > Allow JavaScript from Apple Events`, then log in to Schwab manually.
-
-If you prefer the older Chrome workflow, use `SchwabInChrome.sh` (or equivalent)
-so Chrome is running with remote debugging on port `9222`, then pass
-`--browser chrome-cdp` when running the scraper.
-
-### 2) Extract Schwab lot CSVs
+Use the repo-local virtual environment when running Python scripts:
 
 ```bash
-python scrape_schwab_lots.py
-# or
-python scrape_schwab_lots.py "Inheritance"
-python scrape_schwab_lots.py "Joint Account"
-# Chrome fallback:
-python scrape_schwab_lots.py --browser chrome-cdp
+source .venv/bin/activate
 ```
 
-Output is written to `SchwabLots/<Schwab account name>.csv`.
-The script opens each holding's Schwab Lot Details overlay and writes the table
-to one combined CSV locally, with `Symbol` as the first column on each lot row,
-so it does not depend on Schwab's browser download event.
+## Repository Layout
 
-### 3) Prepare working lot folder for rebuild
+|Entry|Description|
+|----|----|
+| SchwabLots | a directory with Schwab lot data, with a file per investment account|
+| QuickenExports | exports from Quicken. The XLSX file contains all investment accounts and lot details|
+| scrape_schwab_lots.py | extracts a combined Schwab lot CSV from a logged-in browser session into SchwabLots.|
+| lot_basis_comparison.py | compare lots between Quicken and Schwab, using the Schwab CSV with the newest dated Quicken lots workbook.|
+| schwab_quicken_rebuild.py | builds grouped Add Shares checklist output from the combined Schwab CSV.|
+| SchwabInChrome.sh | starts Chrome for use by the scarepe_schwab_lots.py script|
+| RepairQuickenTransactions.md |  manual Quicken repair procedure|
 
-`schwab_quicken_rebuild.py` expects exactly one combined Schwab lot CSV in
-`./SchwabLots/`.
+The contents of QuickenExports is produced on PamelaPC by a Power Automation script.
 
-### 4) Build Quicken checklist output
+
+## Current Data Contract
+
+`lot_basis_comparison.py` expects:
+
+- a combined Schwab CSV in `SchwabLots/`
+- a Quicken lot workbooks named `QuickenExports/QuickenLots_YYYY-MM-DD.xlsx`
+
+## Compare Schwab To Quicken
+
+Run the default compact comparison table:
 
 ```bash
-python schwab_quicken_rebuild.py
+.venv/bin/python lot_basis_comparison.py
+```
+
+The default table has one row per symbol, paired Schwab and Quicken share/cost
+basis totals, Schwab and Quicken lot counts, market value, and a totals row.
+Matching Quicken-side values display as `=`.
+
+`--show-discrepancies` appends detailed per-lot comparison lines.
+
+`--show-recent-matches` adds the optional `Recent Matching Lots` column.
+
+`-t` / `--transactions` appends one aggregate adjustment row per flagged symbol.
+These rows are intended to make Quicken totals match Schwab totals without
+recreating Schwab lots. Each row shows:
+
+- `Share Change` = Schwab shares minus Quicken shares
+- `Cost Basis Change` = Schwab cost basis minus Quicken cost basis
+- `Target Shares` and `Target Cost Basis` = Schwab totals
+
+## Extract Schwab Lots
+
+Safari is the default scraper backend:
+
+```bash
+.venv/bin/python scrape_schwab_lots.py
+.venv/bin/python scrape_schwab_lots.py "Inheritance"
+```
+
+Before running the Safari workflow, log in to Schwab manually and enable:
+
+`Develop > Allow JavaScript from Apple Events`
+
+Output is written to `SchwabLots/<Schwab account name>.csv`.
+
+Chrome is still available as a fallback backend:
+
+```bash
+./SchwabInChrome.sh
+.venv/bin/python scrape_schwab_lots.py --browser chrome-cdp
+```
+
+The scraper reads the visible Schwab Lot Details table and writes one combined
+CSV with `Symbol` as the first column.
+
+## Rebuild Checklist Script
+
+`schwab_quicken_rebuild.py` reads the combined Schwab CSV and writes grouped
+manual-entry files:
+
+```bash
+.venv/bin/python schwab_quicken_rebuild.py
 ```
 
 Expected outputs:
@@ -67,26 +97,8 @@ Expected outputs:
 - `quicken_security_subtotals.csv`
 - `schwab_quicken_validation_report.csv`
 
-Validation behavior:
+This script does not currently have command-line options. With the current
+checked-in Schwab CSV, it starts processing immediately and may fail if Schwab
+exports a numeric cell in a format it does not recognize. Use
+`lot_basis_comparison.py -t` for the current aggregate adjustment report.
 
-- If one or more `QuickenExports/QuickenLots_YYYY-MM-DD.xlsx` files exist, the newest dated file is used for validation.
-- If no matching export exists, checklist/subtotals still generate and validation is skipped.
-
-### 5) Optional: lot-level audit
-
-```bash
-python lot_basis_comparison.py
-```
-
-`lot_basis_comparison.py` compares Schwab lots to the matching account section in the Quicken lot export workbook.
-
-## Data Expectations
-
-- Schwab lot files are report-style CSVs where the first line contains title metadata, including `as of` date and masked account suffix.
-- `QuickenExports/QuickenLots_YYYY-MM-DD.xlsx` should be a Portfolio export with lot rows expanded.
-- Numeric fields may include `$`, commas, `*`, or trailing minus notation; scripts normalize these formats.
-
-## Notes
-
-- Rebuild output is designed for manual Add Shares entry in Quicken.
-- Bucketed output intentionally reduces lot granularity to speed manual repair work.
