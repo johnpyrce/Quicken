@@ -104,12 +104,12 @@ class LotComparison:
             )
 
         shares_diff = (
-            f" shares: {self.schwab_shares:.4f} vs {self.quicken_shares:.4f}"
+            f" shares: Schwab {self.schwab_shares:.4f} vs Quicken {self.quicken_shares:.4f}"
             if abs(self.schwab_shares - self.quicken_shares) > 0.01
             else ""
         )
         cost_diff = (
-            f" cost: ${self.schwab_cost_basis:.2f} vs ${self.quicken_cost_basis:.2f}"
+            f" cost: Schwab ${self.schwab_cost_basis:.2f} vs Quicken ${self.quicken_cost_basis:.2f}"
             if abs(self.schwab_cost_basis - self.quicken_cost_basis) > 0.01
             else ""
         )
@@ -201,20 +201,18 @@ def extract_account_suffix_from_title(title_line: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def find_schwab_lot_file() -> Path:
+def find_schwab_lot_file(filename: str = "Inheritance.csv") -> Path:
     if not SCHWAB_LOTS_DIR.exists():
         raise SystemExit(f"ERROR: Schwab lots directory not found: {SCHWAB_LOTS_DIR.resolve()}")
 
-    paths = sorted(SCHWAB_LOTS_DIR.glob("*.csv"))
-    if not paths:
-        raise SystemExit(f"ERROR: No Schwab lots CSV files found in {SCHWAB_LOTS_DIR.resolve()}")
-    if len(paths) > 1:
-        listed = "\n".join(f"  - {path}" for path in paths)
-        raise SystemExit(
-            "ERROR: Expected exactly one combined Schwab lots CSV in "
-            f"{SCHWAB_LOTS_DIR.resolve()}, found {len(paths)}:\n{listed}"
-        )
-    return paths[0]
+    filename = filename.strip()
+    if not filename.lower().endswith(".csv"):
+        filename += ".csv"
+
+    path = SCHWAB_LOTS_DIR / filename
+    if not path.is_file():
+        raise SystemExit(f"ERROR: Schwab lots CSV file not found: {path.resolve()}")
+    return path
 
 
 def find_latest_quicken_lots_file() -> Path:
@@ -877,6 +875,14 @@ def main() -> int:
         description="Compare Schwab lot data to the latest matching Quicken lots workbook."
     )
     parser.add_argument(
+        "schwab_lots_file",
+        nargs="*",
+        help=(
+            "Schwab lots filename in SchwabLots; names may contain spaces and the .csv extension is optional "
+            "(default: Inheritance.csv)"
+        ),
+    )
+    parser.add_argument(
         "--show-discrepancies",
         action="store_true",
         help="display individual lot discrepancy details",
@@ -901,7 +907,8 @@ def main() -> int:
     args = parser.parse_args()
     status_output = sys.stderr if args.format in {"csv", "markdown", "html"} else sys.stdout
 
-    schwab_file = find_schwab_lot_file()
+    schwab_filename = " ".join(args.schwab_lots_file) or "Inheritance.csv"
+    schwab_file = find_schwab_lot_file(schwab_filename)
     quicken_file = find_latest_quicken_lots_file()
 
     print(f"\n=== Parsing Schwab lots: {schwab_file} ===", file=status_output)
