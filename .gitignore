@@ -10,8 +10,7 @@ orig_lots/
 *.csv
 *.xlsx
 *.html
+*.QIF
 
 # exports
-Exports/
-QuickenExports/
 SchwabLots/
