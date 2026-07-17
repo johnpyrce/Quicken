@@ -260,10 +260,43 @@ def safari_ensure_logged_in_positions(account_name: str) -> None:
         )
 
     if "positions" not in current_url:
-        log_info("Opening Schwab Positions page in Safari")
-        safari_run_javascript(
-            f"window.location.href = {json.dumps(POSITIONS_URL)}; JSON.stringify({{url: window.location.href}})"
-        )
+        # A Summary-row account link navigates directly to Positions *with that
+        # account selected*.  Going straight to POSITIONS_URL loses that
+        # context and Schwab falls back to its default (often Rollover IRA).
+        if "/accounts/summary" in current_url:
+            log_info(f"Opening Positions for Safari account: {account_name}")
+            wanted_account = json.dumps(account_name.lower())
+            if not safari_wait_for(
+                f"""(function() {{
+                    var clean = function(s) {{ return (s || '').replace(/\\s+/g, ' ').trim(); }};
+                    return Array.prototype.some.call(document.querySelectorAll('a.acctNavigate-button-link'), function(el) {{
+                        return clean(el.innerText || el.textContent).toLowerCase() === {wanted_account};
+                    }});
+                }})()""",
+                timeout_seconds=20,
+            ):
+                raise RuntimeError(f"Requested Safari account was not found on Summary: {account_name}")
+            result = safari_eval_json(
+                f"""JSON.stringify((function() {{
+                    var clean = function(s) {{ return (s || '').replace(/\\s+/g, ' ').trim(); }};
+                    var wanted = {json.dumps(account_name.lower())};
+                    var links = Array.prototype.slice.call(document.querySelectorAll('a.acctNavigate-button-link'));
+                    var link = links.find(function(el) {{
+                        return clean(el.innerText || el.textContent).toLowerCase() === wanted;
+                    }});
+                    if (!link) return {{clicked: false, reason: 'account link not found on Summary'}};
+                    link.click();
+                    return {{clicked: true, text: clean(link.innerText || link.textContent)}};
+                }})())""",
+                timeout=10,
+            )
+            if not result or not result.get("clicked"):
+                raise RuntimeError(f"Could not open Safari account from Summary: {result}")
+        else:
+            log_info("Opening Schwab Positions page in Safari")
+            safari_run_javascript(
+                f"window.location.href = {json.dumps(POSITIONS_URL)}; JSON.stringify({{url: window.location.href}})"
+            )
         safari_wait_for(
             "window.location.href.toLowerCase().includes('positions') || "
             "/login|signin|authenticate|two-step/i.test(window.location.href)",
@@ -337,26 +370,38 @@ def safari_select_account_if_needed(account_name: str) -> None:
     result = safari_eval_json(
         f"""JSON.stringify((function() {{
             var clean = function(s) {{ return (s || '').replace(/\\s+/g, ' ').trim(); }};
-            var accountName = {json.dumps(account_name.lower())};
-            var controls = Array.prototype.slice.call(document.querySelectorAll('a, button, [role="option"], [role="menuitem"]'));
-            var option = null;
-            for (var i = 0; i < controls.length; i++) {{
-                var text = clean(controls[i].innerText || controls[i].textContent).toLowerCase();
-                if (text.indexOf(accountName) !== -1) {{
-                    option = controls[i];
-                    break;
-                }}
-            }}
-            if (!option) return {{clicked:false, reason:'account option not found'}};
-            option.click();
-            return {{clicked:true, text: clean(option.innerText || option.textContent)}};
+            var selector = document.querySelector('button.account-selector-button') ||
+                Array.prototype.find.call(document.querySelectorAll('button'), function(el) {{
+                    return /account ending/i.test(clean(el.innerText || el.textContent));
+                }});
+            if (!selector) return {{clicked:false, reason:'account selector button not found'}};
+            selector.click();
+            return {{clicked:true, text:'account selector'}};
         }})())""",
         timeout=10,
     )
     if not result or not result.get("clicked"):
         raise RuntimeError(f"Could not switch Safari account automatically: {result}")
 
-    log_info(f"Clicked Safari account option: {result.get('text')}")
+    account_name_json = json.dumps(account_name.lower())
+    option_clicked = safari_wait_for(
+        f"""(function() {{
+            var clean = function(s) {{ return (s || '').replace(/\\s+/g, ' ').trim(); }};
+            var option = Array.prototype.find.call(document.querySelectorAll('a, [role="option"], [role="menuitem"]'), function(el) {{
+                var rect = el.getBoundingClientRect();
+                var style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && clean(el.innerText || el.textContent).toLowerCase().indexOf({account_name_json}) !== -1;
+            }});
+            if (!option) return false;
+            option.click();
+            return true;
+        }})()""",
+        timeout_seconds=10,
+    )
+    if not option_clicked:
+        raise RuntimeError(f"Could not find visible Safari account option: {account_name}")
+
+    log_info(f"Clicked Safari account option: {account_name}")
     ok = safari_wait_for(
         f"""(function() {{
             var clean = function(s) {{ return (s || '').replace(/\\s+/g, ' ').trim(); }};
