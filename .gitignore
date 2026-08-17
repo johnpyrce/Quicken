@@ -12,6 +12,7 @@ orig_lots/
 *.html
 *.QIF
 *.txt
+*.duckdb
 
 # exports
 SchwabLots/

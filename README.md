@@ -9,16 +9,22 @@ are relative to the current directory.
 
 ## Setup
 
-Create or activate the repository's Python virtual environment and install the
-dependencies:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if it is
+not already available, then synchronize the project environment:
 
 ```bash
-source .venv/bin/activate
-python -m pip install -r requirements.txt
+uv sync
 ```
 
-The scripts require Playwright for browser extraction and openpyxl for reading
-Quicken workbooks.
+`uv sync` creates and manages the project virtual environment, installs the
+runtime dependencies, and installs the development tools from the lockfile.
+The scripts require Playwright for browser extraction, openpyxl for reading
+Quicken workbooks, and DuckDB/PyArrow for QIF loading. If Playwright browsers
+are not installed yet, run:
+
+```bash
+uv run playwright install
+```
 
 ## Repository Layout
 
@@ -29,8 +35,34 @@ Quicken workbooks.
 | `scrape_schwab_lots.py` | Extracts one account's visible Schwab lot details from a logged-in browser session. |
 | `lot_basis_comparison.py` | Compares a selected Schwab account CSV with the matching account in the newest Quicken workbook. |
 | `schwab_quicken_rebuild.py` | Legacy tool that creates grouped Add Shares checklist files. |
+| `loader/` | Self-contained QIF-to-DuckDB loader (`qif_to_duckdb.py`, `qif_loader.py`, and `schema.sql`). |
 | `SchwabInChrome.sh` | Starts Chrome with remote debugging for the Chrome scraper backend. |
 | `RepairQuickenTransactions.md` | Manual Quicken repair guidance. |
+
+## Create a DuckDB Database from QIF
+
+The `loader/` directory contains the QIF parser, DuckDB schema, and command-line
+utility. Pass a QIF export as the first argument and an optional output database
+path as the second:
+
+```bash
+uv run python loader/qif_to_duckdb.py QuickenExports/Quicken_2026-08-16.QIF
+uv run python loader/qif_to_duckdb.py \
+  QuickenExports/Quicken_2026-08-16.QIF \
+  QuickenExports/quicken.duckdb
+```
+
+If no output path is supplied, the utility creates `<qif filename>.duckdb` in
+the current directory. Existing databases are protected by default; use
+`--force` to replace one:
+
+```bash
+uv run python loader/qif_to_duckdb.py --force input.qif output.duckdb
+```
+
+The command reports loaded account, category, transaction, and rejected
+transaction counts, and verifies the persisted transaction count before it
+returns successfully.
 
 ## Quicken Extraction
 
@@ -71,7 +103,7 @@ corresponding account in that workbook.
 Run the comparison for the default Schwab file, `SchwabLots/Inheritance.csv`:
 
 ```bash
-.venv/bin/python lot_basis_comparison.py
+uv run python lot_basis_comparison.py
 ```
 
 To select another file, give its name without the `SchwabLots/` directory. The
@@ -79,9 +111,9 @@ To select another file, give its name without the `SchwabLots/` directory. The
 as separate words:
 
 ```bash
-.venv/bin/python lot_basis_comparison.py Contributory
-.venv/bin/python lot_basis_comparison.py Rollover IRA
-.venv/bin/python lot_basis_comparison.py "Rollover IRA.csv"
+uv run python lot_basis_comparison.py Contributory
+uv run python lot_basis_comparison.py Rollover IRA
+uv run python lot_basis_comparison.py "Rollover IRA.csv"
 ```
 
 The compact report contains one row per symbol, paired Schwab and Quicken
@@ -104,10 +136,10 @@ Available report options are:
 Options can be combined. For example:
 
 ```bash
-.venv/bin/python lot_basis_comparison.py "Rollover IRA" \
+uv run python lot_basis_comparison.py "Rollover IRA" \
   --show-discrepancies --show-recent-matches --transactions
 
-.venv/bin/python lot_basis_comparison.py Inheritance \
+uv run python lot_basis_comparison.py Inheritance \
   --format html --transactions > inheritance-report.html
 ```
 
@@ -135,22 +167,22 @@ Safari is the default backend. Before running it:
 Then run:
 
 ```bash
-.venv/bin/python scrape_schwab_lots.py
-.venv/bin/python scrape_schwab_lots.py "Rollover IRA"
+uv run python scrape_schwab_lots.py
+uv run python scrape_schwab_lots.py "Rollover IRA"
 ```
 
 The second example writes `SchwabLots/Rollover IRA.csv`. Use `--output` to
 choose another output directory:
 
 ```bash
-.venv/bin/python scrape_schwab_lots.py "Rollover IRA" --output SchwabLots
+uv run python scrape_schwab_lots.py "Rollover IRA" --output SchwabLots
 ```
 
 Chrome with the DevTools Protocol is available as a fallback:
 
 ```bash
 ./SchwabInChrome.sh
-.venv/bin/python scrape_schwab_lots.py "Inheritance" --browser chrome-cdp
+uv run python scrape_schwab_lots.py "Inheritance" --browser chrome-cdp
 ```
 
 By default the Chrome backend connects to `http://127.0.0.1:9222`. Supply a
@@ -162,7 +194,7 @@ different endpoint with `--cdp-url` if needed.
 manual Add Shares checklist data:
 
 ```bash
-.venv/bin/python schwab_quicken_rebuild.py
+uv run python schwab_quicken_rebuild.py
 ```
 
 Unlike `lot_basis_comparison.py`, this legacy script has no command-line
